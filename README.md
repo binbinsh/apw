@@ -1,3 +1,9 @@
+> **GPL maintenance fork:** `codex/batch-maintenance` adds exact native notes editing,
+> recoverable redundant-note deletion, targeted batch inspection, and journaled
+> execution/resume. These functions use a macOS Accessibility helper; they do not
+> provide a public whole-vault Apple API. Live write verification is separate from
+> the synthetic CLI tests. See [maintenance usage and limits](docs/maintenance.md).
+
 <div align="center">
   <a href="https://github.com/bendews/apw">
     <img src="icon.png" alt="Logo" width="80" height="80">

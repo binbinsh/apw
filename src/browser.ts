@@ -1,6 +1,7 @@
 import bridgeSource from "../ext/bridge.js" with { type: "text" };
 import { writeConfig } from "./config.ts";
 import { APWError, BROWSER_PROFILE_PATH, EXTENSION_PATH, Status } from "./const.ts";
+import trust from "./extension-trust.json" with { type: "json" };
 
 const HOME = Deno.env.get("HOME")!;
 const APPLE_MANIFEST = "/Library/Google/Chrome/NativeMessagingHosts/com.apple.passwordmanager.json";
@@ -74,6 +75,8 @@ function copyDirectory(source: string, target: string): void {
 }
 
 function extensionSource(): string | undefined {
+  const explicit = Deno.env.get("APW_EXTENSION_SOURCE") ?? `${Deno.execPath().replace(/\/[^/]+$/, "")}/APWExtension`;
+  if (exists(`${explicit}/${BACKGROUND}`)) return explicit;
   for (const { dataPath } of BROWSERS) {
     for (const profile of directories(dataPath)) {
       const base = `${dataPath}/${profile}/Extensions/${EXTENSION_ID}`;
@@ -85,11 +88,39 @@ function extensionSource(): string | undefined {
   }
 }
 
-function buildExtension(config: { port: number; token: string }): void {
+async function validateExtension(source: string): Promise<void> {
+  if (Deno.lstatSync(source).isSymlink) throw new APWError(Status.INVALID_PARAM, "unsafe_extension_source");
+  for (const [name, expected] of Object.entries(trust.file_hashes)) {
+    const path = `${source}/${name}`;
+    const parts = name.split("/");
+    for (let i = 1; i <= parts.length; i++) {
+      if (Deno.lstatSync(`${source}/${parts.slice(0, i).join("/")}`).isSymlink) {
+        throw new APWError(Status.INVALID_PARAM, "unsafe_extension_source");
+      }
+    }
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", Deno.readFileSync(path)));
+    if (Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("") !== expected) {
+      throw new APWError(Status.INVALID_PARAM, "extension_verification_failed");
+    }
+  }
+  function walk(path: string, prefix = ""): void {
+    for (const entry of Deno.readDirSync(path)) {
+      const name = prefix + entry.name;
+      if (entry.isSymlink) throw new APWError(Status.INVALID_PARAM, "unsafe_extension_source");
+      if (entry.isDirectory) walk(`${path}/${entry.name}`, name + "/");
+      else if (!(name in trust.file_hashes) && name !== "ap-source-verification.json") {
+        throw new APWError(Status.INVALID_PARAM, "extension_verification_failed");
+      }
+    }
+  }
+  walk(source);
+}
+
+async function buildExtension(config: { port: number; token: string }): Promise<void> {
   const background = `${EXTENSION_PATH}/${BACKGROUND}`;
   const orig = `${background}.orig`;
 
-  if (!exists(orig)) {
+  {
     const source = extensionSource();
     if (!source) {
       throw new APWError(
@@ -97,6 +128,7 @@ function buildExtension(config: { port: number; token: string }): void {
         "Apple Passwords extension not found. Install it from the Chrome Web Store.",
       );
     }
+    await validateExtension(source);
     remove(EXTENSION_PATH);
     Deno.mkdirSync(EXTENSION_PATH, { recursive: true });
     copyDirectory(source, EXTENSION_PATH);
@@ -151,34 +183,54 @@ async function loadExtension(port: number): Promise<void> {
   }
 }
 
+export function browserArguments(browser: Browser, mode = Deno.env.get("APW_BROWSER_MODE") ?? "headless"): string[] {
+  if (mode !== "headless" && mode !== "visible") throw new APWError(Status.INVALID_PARAM, "apple_browser_mode_invalid");
+  return [
+    `--user-data-dir=${browser.profile}`,
+    "--remote-debugging-port=0",
+    "--remote-debugging-address=127.0.0.1",
+    "--enable-unsafe-extension-debugging",
+    ...(mode === "headless" ? ["--headless=new"] : []),
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-background-timer-throttling",
+    "--disable-backgrounding-occluded-windows",
+    ...(mode === "visible" ? ["about:blank"] : []),
+  ];
+}
+
 export async function launchBrowser(
   browser: Browser,
   config: { port: number; token: string },
 ): Promise<Deno.ChildProcess> {
-  buildExtension(config);
+  // Reject unsupported modes before any extension or profile mutation.
+  const args = browserArguments(browser);
+  await buildExtension(config);
   remove(browser.profile);
   const hosts = `${browser.profile}/NativeMessagingHosts`;
   Deno.mkdirSync(hosts, { recursive: true });
   Deno.copyFileSync(APPLE_MANIFEST, `${hosts}/com.apple.passwordmanager.json`);
 
-  const port = 9500 + Math.floor(Math.random() * 400);
   const child = new Deno.Command(browser.bin, {
-    args: [
-      `--user-data-dir=${browser.profile}`,
-      `--remote-debugging-port=${port}`,
-      "--remote-allow-origins=*",
-      "--enable-unsafe-extension-debugging",
-      "--headless=new",
-      "--no-first-run",
-      "--no-default-browser-check",
-      "--disable-background-timer-throttling",
-      "--disable-backgrounding-occluded-windows",
-    ],
+    args,
     stdout: "null",
     stderr: "null",
   }).spawn();
 
   try {
+    // Read the endpoint written by this browser in this freshly created profile,
+    // so a random-port collision cannot attach us to another user's browser.
+    let port = 0;
+    for (let attempt = 0; attempt < 60; attempt++) {
+      try {
+        const lines = Deno.readTextFileSync(`${browser.profile}/DevToolsActivePort`).split("\n");
+        port = Number(lines[0]);
+        if (port > 0 && port < 65536 && lines[1]?.startsWith("/devtools/browser/")) break;
+        port = 0;
+      } catch { /* starting */ }
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (!port) throw new APWError(Status.SERVER_ERROR);
     await loadExtension(port);
     return child;
   } catch (error) {

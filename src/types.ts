@@ -1,6 +1,7 @@
 import { Command, Status } from "./const.ts";
 
 export type Message =
+  | { op: "status" | "stop" }
   | { cmd: Command.HANDSHAKE; pin?: string }
   | {
     cmd: number;
@@ -9,6 +10,8 @@ export type Message =
     frameId: number;
     url?: string;
     body: unknown;
+    apwWaitMS?: number;
+    apwWaitToken?: string;
   };
 
 export type DecryptedData = { STATUS: number } & Record<string, unknown>;

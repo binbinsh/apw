@@ -2,26 +2,16 @@
 .cache
 deps
 deno-test-results.xml
-
-# TypeScript
-*.tsbuildinfo
-
-# Node.js
+# Dependencies/editor files
 node_modules
-npm-debug.log
-yarn-error.log
-
-# Editor/IDE
+*.tsbuildinfo
 .vscode
 .idea
-*.sublime-project
-*.sublime-workspace
-
-# Build output
-dist
-
-# Other
-*.psd
-
-# Binary
+# Builds and private runtime artifacts
+dist/
+reports/
 apw
+apw-maintenance
+.DS_Store
+*.trial/
+*.jsonl

@@ -57,6 +57,19 @@ func recoverableDialog(words:[String],ordinaryButton:Bool,permanentButton:Bool)-
   return value.contains("已删除") || value.contains("最近删除") || value.contains("恢复") || s.contains("recently deleted") || s.contains("recover")
  }
 }
+struct RecoverableDialogFrame:Decodable {
+ let complete,window_unique,sheet_unique,process_window_bound,owner_unchanged,fields_exact,identity_exact,recoverable,ordinary_unique,sheet_readonly,permanent_present:Bool
+ let permanent_button_count:Int
+ var verified:Bool {complete && window_unique && sheet_unique && process_window_bound && owner_unchanged && fields_exact && identity_exact && recoverable && ordinary_unique && sheet_readonly && !permanent_present && permanent_button_count==0}
+}
+struct RecoverableDialogWitness {
+ var previous:RecoverableDialogFrame?
+ mutating func observe(_ frame:RecoverableDialogFrame,sameBindings:Bool)->Bool {
+  guard frame.verified else{previous=nil;return false}
+  defer{previous=frame}
+  return previous?.verified==true && sameBindings
+ }
+}
 func addressedSelectionScope(role:String,identifier:String,subrole:String)->Bool {
  (identifier=="NotesField" && ["AXTextArea","AXTextField"].contains(role)) || (subrole=="AXSearchField" && role=="AXTextField")
 }
@@ -417,6 +430,23 @@ if args==["--policy-test"] {
    let firstBytes=try? JSONSerialization.data(withJSONObject:first),let secondBytes=try? JSONSerialization.data(withJSONObject:second),
    let before=try? JSONDecoder().decode(CurrentCategoryIndexFrame.self,from:firstBytes),let after=try? JSONDecoder().decode(CurrentCategoryIndexFrame.self,from:secondBytes) else{exit(2)}
   result=categoryModelPairPermits(before,after,referencesSame:q["references_same"] as? Bool ?? false)
+ case "recoverable-dialog-wait":
+  guard let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
+  var incomplete=q["prior_incomplete"] as? Bool ?? false
+  let prior=incomplete
+  var witness=RecoverableDialogWitness(),verified=false
+  for raw in frames {
+   guard raw["deadline_valid"] as? Bool==true,raw["owner_unchanged"] as? Bool==true else{break}
+   guard let bytes=try? JSONSerialization.data(withJSONObject:raw),let frame=try? JSONDecoder().decode(RecoverableDialogFrame.self,from:bytes) else{exit(2)}
+   let observation=independentComplete(get:{incomplete},set:{incomplete=$0}) {()->RecoverableDialogFrame in
+    for code in raw["codes"] as? [Int] ?? [] {if let error=AXError(rawValue:Int32(code)),nativeReadErrorRefuses(error,required:true) {incomplete=true}}
+    return frame
+   }
+   if let observation {
+    if witness.observe(observation,sameBindings:raw["same_bindings"] as? Bool==true) {verified=true;break}
+   } else {witness.previous=nil}
+  }
+  result=["verified":verified,"prior_preserved":incomplete==prior,"delete_dispatches":0,"confirmation_dispatches":0]
  case "readonly-context-wait":
   guard let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
   var incomplete=q["prior_incomplete"] as? Bool ?? false
@@ -679,7 +709,7 @@ func confirmRecoverable(_ i:Item,probe:Bool=false)->Bool {
  guard front() else{return false}
  let title=Data(i.title.utf8).base64EncodedString(),note=Data(i.expected_note.utf8).base64EncodedString()
  let address=probe ? "w":confirmationEditorAddress(AXUIElementCreateApplication(appPID))
- guard let address else{report["confirmation_bridge_failure"]="editor_address_unavailable";return false}
+ guard let address,!nativeObservationIncomplete else{report["confirmation_bridge_failure"]="editor_address_unavailable";return false}
  let editorRole=probe ? "AXGroup":(report["confirmation_native_editor_role"] as? String ?? "")
  let source="""
  use framework "Foundation"
@@ -1371,6 +1401,66 @@ func closeOwnEditor() {
 }
 func nativeFailure(_ name:String)->NSError {NSError(domain:"APWMaintenance",code:1,userInfo:[NSLocalizedDescriptionKey:"maintenance_"+name])}
 func require(_ ok:Bool,_ name:String)throws {if !ok {throw nativeFailure(name)}}
+let deleteDialogDiagnosticKeys=["delete_dialog_previous_incomplete","delete_dialog_observation_complete","delete_dialog_verified","delete_dialog_fields_exact","delete_dialog_recoverable","delete_dialog_binding_verified","delete_dialog_frames_observed"]
+struct RecoverableDialogObservation {
+ let frame:RecoverableDialogFrame;let window,sheet,confirm:AXUIElement
+ func sameBindings(_ previous:RecoverableDialogObservation)->Bool {CFEqual(window,previous.window) && CFEqual(sheet,previous.sheet) && CFEqual(confirm,previous.confirm)}
+}
+// This is an observation after one DeleteButton dispatch, never an action
+// retry. A valid current pair retires only earlier transition history.
+func awaitRecoverableDialog(_ root:AXUIElement,_ n:NativeRead)throws {
+ let requestDeadline=deadline,until=min(deadline,Date(timeIntervalSinceNow:3))
+ deadline=until;defer{deadline=requestDeadline}
+ report["delete_dialog_previous_incomplete"]=nativeObservationIncomplete
+ report["delete_dialog_verified"]=false;report["delete_dialog_frames_observed"]=0
+ var witness=RecoverableDialogWitness(),previous:RecoverableDialogObservation?
+ while Date()<until,front() {
+  let observed=completeDiscovery {()->RecoverableDialogObservation? in
+   let view=nodes(root)
+   let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement] ?? []
+   let sheets=view.filter{text($0,kAXRoleAttribute)=="AXSheet"}
+   guard windows.count==1,text(windows[0],kAXSubroleAttribute)=="AXStandardWindow",sheets.count==1 else{return nil}
+   let window=windows[0],sheet=sheets[0],sheetNodes=nodes(sheet),fs=fields(view)
+   let permanentNames=["永久删除","立即永久删除","Delete Permanently","Permanently Delete"]
+   let permanentCount=sheetNodes.filter{text($0,kAXRoleAttribute)=="AXButton" && values([$0]).contains(where:{permanentNames.contains($0)})}.count
+   let permanent=permanentCount>0
+   let confirm=button(sheetNodes,["删除密码","删除备注","删除此密码","删除","Delete Password","Delete Note","Delete"])
+   let ordinaryUnique=confirm != nil
+   let recoverable=recoverableDialog(words:values(sheetNodes),ordinaryButton:ordinaryUnique,permanentButton:permanent)
+   let fieldsExact=fs==n.fieldValues
+   report["delete_dialog_fields_exact"]=fieldsExact;report["delete_dialog_recoverable"]=recoverable
+   guard let confirm else{return nil}
+   let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
+   var processBound=running.count==1 && running[0].processIdentifier==appPID && apple(appPID)
+   for element in [root,window,sheet,confirm] {
+    var pid:pid_t=0;let code=AXUIElementGetPid(element,&pid);observeNativeError(code,required:true)
+    processBound=processBound && code == .success && pid==appPID
+   }
+   let windowBound=notesProbeAncestorBound(sheet,window) && notesProbeAncestorBound(confirm,sheet)
+   report["delete_dialog_binding_verified"]=processBound && windowBound
+   let editableRoles:Set<String>=["AXTextField","AXTextArea","AXComboBox","AXSecureTextField","AXCheckBox","AXRadioButton","AXSlider","AXPopUpButton"]
+   let readonlySheet = !sheetNodes.contains{editableRoles.contains(text($0,kAXRoleAttribute))}
+   let identityExact=["TitleField","UserNameField","PasswordField","NotesField"].allSatisfy{fs[$0] != nil && fs[$0]==n.fieldValues[$0]}
+   let frame=RecoverableDialogFrame(complete:!nativeObservationIncomplete,window_unique:true,sheet_unique:true,process_window_bound:processBound && windowBound,owner_unchanged:front(),fields_exact:fieldsExact,identity_exact:identityExact,recoverable:recoverable,ordinary_unique:ordinaryUnique,sheet_readonly:readonlySheet,permanent_present:permanent,permanent_button_count:permanentCount)
+   return RecoverableDialogObservation(frame:frame,window:window,sheet:sheet,confirm:confirm)
+  }
+  report["delete_dialog_frames_observed"]=min(3000,(report["delete_dialog_frames_observed"] as? Int ?? 0)+1)
+  if let observed,let current=observed {
+   report["delete_dialog_observation_complete"]=current.frame.complete
+   guard Date()<until,front() else{break}
+   let same=previous.map{current.sameBindings($0)} ?? false
+   if witness.observe(current.frame,sameBindings:same) {
+    // Current complete fields/identity and a stable recoverable dialog are
+    // proved. Keep error counters; future errors remain rejecting.
+    nativeObservationIncomplete=false;report["delete_dialog_verified"]=true
+    return
+   }
+   previous=current.frame.verified ? current:nil
+  } else {witness.previous=nil;previous=nil;report["delete_dialog_observation_complete"]=false}
+  pause(0.04)
+ }
+ throw nativeFailure("recoverable_confirmation_refused")
+}
 struct NotesSettableObservation:Equatable {
  let role:String
  let rangeCode,textCode,valueCode:Int
@@ -2894,13 +2984,7 @@ func execute(_ q:[String:Any])throws->[String:Any] {
  guard candidateOnly,fields(nodes(root))==n.fieldValues else{_=cancel(root,n);throw nativeFailure("redundant_note_proof_refused")}
  let bs=nodes(root).filter{text($0,kAXRoleAttribute)=="AXButton" && text($0,kAXIdentifierAttribute)=="DeleteButton"}
  guard bs.count==1,boundedClick(bs[0],root) else{_=cancel(root,n);throw nativeFailure("delete_entry_refused")}
- pause(0.1)
- let sheets=nodes(root).filter{text($0,kAXRoleAttribute)=="AXSheet"}
- try require(sheets.count==1,"delete_confirmation_unverified")
- let ns=nodes(sheets[0]),words=values(ns)
- let permanent=button(ns,["永久删除","立即永久删除","Delete Permanently","Permanently Delete"]) != nil
- let confirm=button(ns,["删除密码","删除备注","删除此密码","删除","Delete Password","Delete Note","Delete"])
- try require(recoverableDialog(words:words,ordinaryButton:confirm != nil,permanentButton:permanent) && fields(nodes(root))==n.fieldValues && !nativeObservationIncomplete,"recoverable_confirmation_refused")
+ try awaitRecoverableDialog(root,n)
  let note=before["notes"] as? String ?? ""
  let syntheticItem=Item(id:"native-maintenance",title:before["native_title"] as? String ?? "",expected_note:note,source_ids:[],retained:Target(title:"",native_title:"",username:"",notes:"",urls:[]))
  try require(confirmRecoverable(syntheticItem),"delete_outcome_requires_review")
@@ -2928,7 +3012,7 @@ while let line=readLine(strippingNewline:true) {
  deadline=Date(timeIntervalSinceNow:90);nativeObservationIncomplete=false
  foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil
  for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {report[key]=nil}
- for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys {report[key]=nil}
+ for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys + deleteDialogDiagnosticKeys {report[key]=nil}
  var response:[String:Any]=["ok":false,"app_activated":false,"backend":"apple-passwords-accessibility"]
  do {
   guard line.utf8.count<=4*1024*1024,let bytes=line.data(using:.utf8),let q=try JSONSerialization.jsonObject(with:bytes) as? [String:Any],let id=q["id"] as? Int else{throw nativeFailure("request_invalid")}
@@ -2943,7 +3027,7 @@ while let line=readLine(strippingNewline:true) {
   for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {
    if let value=report[key] {diagnostics[key]=value}
   }
-  for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys {if let value=report[key] {diagnostics[key]=value}}
+  for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys + deleteDialogDiagnosticKeys {if let value=report[key] {diagnostics[key]=value}}
   response["diagnostics"]=diagnostics
  }
  foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil

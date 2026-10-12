@@ -69,6 +69,12 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
   for (const name of ["deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete"]) {
     if (typeof raw[name] === "boolean") out[name]=raw[name];
   }
+  for (const name of ["delete_dialog_previous_incomplete","delete_dialog_observation_complete","delete_dialog_verified",
+    "delete_dialog_fields_exact","delete_dialog_recoverable","delete_dialog_binding_verified"]) {
+    if (typeof raw[name] === "boolean") out[name]=raw[name];
+  }
+  const dialogFrames=raw.delete_dialog_frames_observed;
+  if (typeof dialogFrames === "number" && Number.isInteger(dialogFrames) && dialogFrames>=0 && dialogFrames<=3000) out.delete_dialog_frames_observed=dialogFrames;
   const deletedFrames=raw.deleted_frames_observed;
   if (typeof deletedFrames === "number" && Number.isInteger(deletedFrames) && deletedFrames>=0 && deletedFrames<=3000) out.deleted_frames_observed=deletedFrames;
   for (const name of ["synthetic_input_permission", "synthetic_input_selection_verified", "synthetic_input_postimage_verified",

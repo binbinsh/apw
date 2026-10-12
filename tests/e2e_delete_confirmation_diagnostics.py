@@ -120,7 +120,9 @@ for line in sys.stdin:
                 "confirmation_editor_path_depth": 17,
             }, {})
             calls = [json.loads(line)["op"] for line in calls_path.read_text().splitlines()]
-            check("one delete dispatch per failing invocation, without retry", calls == ["read", "read", "delete-redundant-note"] * len(invocations))
+            # The existing collision preflight is readonly and precedes the one
+            # mutation. Keep an exact sequence so extra reads/retries still fail.
+            check("one delete dispatch per failing invocation, without retry", calls == ["read", "read", "deleted-location-read", "delete-redundant-note"] * len(invocations))
             check("synthetic backing records never changed", json.loads(data_path.read_text()) == [candidate, keeper])
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"

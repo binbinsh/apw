@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Real compiled CLI native-failure diagnostics, with an isolated synthetic helper."""
+"""Real compiled CLI native-failure diagnostics, with an isolated synthetic helper.
+
+Delete-dialog failure specification: six named observations accept strict bool
+only; frames accepts only an integer 0..3000. True/False and frame boundaries
+must survive, while strings, containers, null, integer-as-bool, bool-as-count,
+fractional/out-of-range counts and arbitrary unknown secret data must be dropped.
+The diagnostic cannot turn a refused native operation into successful readback.
+"""
 import argparse
 import json
 import os
@@ -65,6 +72,13 @@ SAFE = {
     "deleted_frames_observed": 2,
     "search_clear_method": "addressed_selected_text",
     "search_clear_failure": "clear_text_submission_failed",
+    "delete_dialog_previous_incomplete": True,
+    "delete_dialog_observation_complete": False,
+    "delete_dialog_verified": True,
+    "delete_dialog_fields_exact": False,
+    "delete_dialog_recoverable": True,
+    "delete_dialog_binding_verified": False,
+    "delete_dialog_frames_observed": 2,
 }
 SECRET = "APW_SYNTHETIC_DIAGNOSTIC_SECRET_20261012"
 
@@ -204,11 +218,28 @@ def main():
                 "deleted_frames_observed": 3001,
                 "search_clear_method": SECRET,
                 "search_clear_failure": SECRET,
+                "delete_dialog_previous_incomplete": SECRET,
+                "delete_dialog_observation_complete": 1,
+                "delete_dialog_verified": {"notes": SECRET},
+                "delete_dialog_fields_exact": "true",
+                "delete_dialog_recoverable": None,
+                "delete_dialog_binding_verified": [],
+                "delete_dialog_frames_observed": 3001,
             }
             reply = run("malformed-allowed-keys", malformed)
             check("allowed diagnostic keys reject free text, containers and wrong scalar types", reply.get("diagnostics", {}) == {})
             reply = run("unavailable-status", {"status": "unavailable", "notes": SECRET})
             check("known unavailable context classification survives without free text", reply.get("diagnostics") == {"status": "unavailable"})
+
+            for index, value in enumerate((0, 3000)):
+                reply = run("delete-dialog-count-boundary-" + str(index), {"delete_dialog_frames_observed": value, "unknown": SECRET})
+                check("delete-dialog exact integer boundary " + str(index), reply.get("diagnostics") == {"delete_dialog_frames_observed": value})
+            for index, value in enumerate((-1, 3001, True, False, 1.5, SECRET, {}, [], None)):
+                reply = run("delete-dialog-count-malicious-" + str(index), {"delete_dialog_frames_observed": value})
+                check("delete-dialog malformed count dropped " + str(index), reply.get("diagnostics", {}) == {})
+            bool_keys = [key for key in SAFE if key.startswith("delete_dialog_") and key != "delete_dialog_frames_observed"]
+            reply = run("delete-dialog-reversed-booleans", {key:not SAFE[key] for key in bool_keys})
+            check("delete-dialog both exact bool values survive", reply.get("diagnostics") == {key:not SAFE[key] for key in bool_keys})
 
             recovery_variants = [("search_clear_method", value) for value in ["addressed_semantic_clear", "addressed_value_then_semantic_clear", "addressed_value_cycle"]] + [("search_clear_failure", value) for value in ["clear_binding_unverified", "clear_value_submission_failed"]]
             for field, value in recovery_variants:
@@ -244,7 +275,7 @@ def main():
                 reply=run("malformed-search-frame-counts-"+str(index),{"search_model_frame_counts":bad_counts})
                 check("malformed search frame counts "+str(index)+" are refused",reply.get("diagnostics",{})=={})
             records = [json.loads(line) for line in calls.read_text().splitlines()]
-            check("one failing native read per invocation, without retry", records == [{"op":"read"}]*(3+len(recovery_variants)+len(invalid_frames)+len(invalid_counts)))
+            check("one failing native read per invocation, without retry", records == [{"op":"read"}]*len(invocations))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
 

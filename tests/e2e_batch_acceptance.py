@@ -60,7 +60,7 @@ for line in sys.stdin:
  if len(found)!=1: r.update(ok=False,error='maintenance_item_not_found' if not found else 'maintenance_item_ambiguous')
  elif op in ['read','deleted-read']: r.update(ok=True,state=found[0])
  elif op=='notes-set':
-  s['writes'].append(op);found[0]['notes']=q['notes'];r.update(ok=True)
+  s['writes'].append(op);found[0]['notes']=q['notes'];r.update(ok=True,persisted=True,background_only=True,original_foreground_preserved=True,input_keyboard_focus_preserved=True,input_focus_owner_kind='present',keyboard_focus_scope='focus_setter_through_save',credentials_changed=1,exports=0,imports=0,state=found[0])
  elif op=='delete-redundant-note':
   s['writes'].append(op);s['active'].remove(found[0]);s['deleted'].append(found[0]);r.update(ok=True,recoverable=True)
   if s['mode']=='keeper-drift': s['active'][0]['notes']+=' unexpected keeper drift'

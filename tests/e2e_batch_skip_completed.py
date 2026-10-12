@@ -41,7 +41,7 @@ for line in sys.stdin:
  if q['op']=='deleted-location-read': r.update(ok=False,error='maintenance_operation_unsupported')
  elif len(found)!=1: r.update(ok=False,error='maintenance_item_not_found' if not found else 'maintenance_item_ambiguous')
  elif q['op'] in ('read','deleted-read'): r.update(ok=True,state=found[0])
- elif q['op']=='notes-set': found[0]['notes']=q['notes']; s['writes']+=1; r.update(ok=True)
+ elif q['op']=='notes-set': found[0]['notes']=q['notes']; s['writes']+=1; r.update(ok=True,persisted=True,background_only=True,original_foreground_preserved=True,input_keyboard_focus_preserved=True,input_focus_owner_kind='present',keyboard_focus_scope='focus_setter_through_save',credentials_changed=1,exports=0,imports=0,state=found[0])
  elif q['op']=='delete-redundant-note': s['active'].remove(found[0]); s['deleted'].append(found[0]); s['writes']+=1; r.update(ok=True,recoverable=True)
  else: r.update(ok=False,error='maintenance_operation_unsupported')
  with open(p,'w') as f: json.dump(s,f)

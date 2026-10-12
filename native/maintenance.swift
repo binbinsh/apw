@@ -84,6 +84,29 @@ func independentComplete<T>(get:()->Bool,set:(Bool)->Void,operation:()->T)->T? {
  let result=operation(),complete = !get();set(prior)
  return complete ? result:nil
 }
+struct InitialIndexScanObservation:Decodable {
+ let frame_present,frame_verified,frame_incomplete,owner_valid,deadline_valid:Bool
+}
+func initialIndexScanDecision(_ frame:InitialIndexScanObservation,attempt:Int)->String {
+ guard frame.owner_valid,frame.deadline_valid else{return "hold"}
+ if frame.frame_present {return frame.frame_verified && !frame.frame_incomplete ? "accept":"hold"}
+ return attempt==0 && frame.frame_incomplete ? "retry":"hold"
+}
+struct SearchClearInitialObservation:Decodable {
+ let complete,context_available,owner_same,keyboard_same,category_matches,query_read,rows_read,deadline_valid:Bool
+ let raw_count:Int
+ var permitted:Bool {complete && context_available && owner_same && keyboard_same && category_matches && query_read && rows_read && deadline_valid && (0...3000).contains(raw_count)}
+}
+struct SearchClearInitialWitness {
+ private var ownerChanged=false
+ mutating func observeOwner(ownerSame:Bool,keyboardSame:Bool)->Bool {
+  if !ownerSame || !keyboardSame {ownerChanged=true}
+  return !ownerChanged
+ }
+ mutating func observe(_ frame:SearchClearInitialObservation)->Bool {
+  observeOwner(ownerSame:frame.owner_same,keyboardSame:frame.keyboard_same) && frame.permitted
+ }
+}
 struct SearchPreparationFrame {
  let complete,queryMatches,categoryMatches,ownerUnchanged:Bool
  let rawCount,publishedCount:Int
@@ -308,6 +331,116 @@ func foregroundNoteInputPermits(_ q:[String:Any])->Bool {
   (phase=="selection" || yes("selection_verified")) &&
   notesProbeForegroundOwnerPermits(original:pid_t(q["original"] as? Int ?? 0),foreground:pid_t(q["foreground"] as? Int ?? 0),passwords:pid_t(q["passwords"] as? Int ?? 0),keyboard:(q["keyboard"] as? Int).map(pid_t.init),deadlineValid:yes("deadline_valid"),internalComplete:yes("observation_complete"),internalBound:yes("internal_focus_exact"))
 }
+// Ordinary notes share the proven exact-field pipeline with a separate
+// append-only entry policy. No fixture assumptions authorize real changes.
+func ordinaryNotesAppendPermits(_ expected:[String:Any],_ after:String)->Bool {
+ guard editorRecoveryPermits(expected:expected,observed:expected,complete:true,unique:true),
+  let key=expected["key"] as? [String:String],let title=key["title"],let username=key["username"],
+  !title.isEmpty,title.utf16.count<=4096,username.utf16.count<=4096,!title.contains("\0"),!username.contains("\0"),
+  let old=expected["notes"] as? String,let nativeTitle=expected["native_title"] as? String,let password=expected["password"] as? String,
+  expected["sharing"] as? String=="unshared",["absent","present","unknown"].contains(expected["otp"] as? String ?? ""),
+  ["absent","present","unknown"].contains(expected["passkey"] as? String ?? ""),
+  let sites=expected["sites"] as? [String],let extra=expected["extra_fields"] as? [[String:String]],
+  [old,nativeTitle,password,after].allSatisfy({!$0.contains("\0")}),sites.allSatisfy({!$0.isEmpty && !$0.contains("\0")}),extra.allSatisfy({$0.keys.allSatisfy{!$0.contains("\0")} && $0.values.allSatisfy{!$0.contains("\0")}}) else{return false}
+ let original=Array(old.utf16),intended=Array(after.utf16)
+ return intended.count>original.count && intended.count<=4096 && Array(intended.prefix(original.count))==original
+}
+// Separate synthetic-only background mutation. Never used by notes-set.
+func backgroundInputAppendPermits(_ expected:[String:Any],_ after:String)->Bool {
+ guard notesProbeFixtureValid(expected),let key=expected["key"] as? [String:String],
+  let title=key["title"],["apw API 测试 · SSO 与备注","apw API 测试 · 独立备注"].contains(title),
+  expected["native_title"] as? String==title,let old=expected["notes"] as? String,
+  ["absent","unknown"].contains(expected["otp"] as? String ?? ""),
+  ["absent","unknown"].contains(expected["passkey"] as? String ?? ""),!after.contains("\0") else{return false}
+ let original=Array(old.utf16),replacement=Array(after.utf16)
+ guard replacement.count>original.count,replacement.count<=4096,replacement.count-original.count<=512,
+  Array(replacement.prefix(original.count))==original else{return false}
+ return String(decoding:replacement.dropFirst(original.count),as:UTF16.self).contains("APW_BACKGROUND_INPUT_SYNTHETIC_V2")
+}
+func backgroundInputFlagsPermit(raw:UInt64,postAccess:Bool)->Bool {
+ // SDK CGEventTypes.h: NonCoalesced identifies mouse/pen coalescing state.
+ // Other/reserved bits, including numeric-pad context, remain conservative.
+ postAccess && raw & ~CGEventFlags.maskNonCoalesced.rawValue == 0
+}
+func backgroundInputPhasePermits(phase:String,action:String,foregroundSame:Bool,preimageExact:Bool,stateComplete:Bool,strictOwnerExact:Bool,savedList:Bool)->Bool {
+ guard foregroundSame,["readonly_preimage","strict_mutation","readonly_postimage"].contains(phase) else{return false}
+ switch action {
+ case "capture":return phase=="readonly_preimage" && preimageExact && stateComplete
+ case "focus","range","unicode","selected_text","save":return phase=="strict_mutation" && strictOwnerExact
+ case "release":return phase=="strict_mutation" && strictOwnerExact && savedList
+ case "observe":return phase != "strict_mutation" || strictOwnerExact
+ case "cancel":return phase=="readonly_postimage" && stateComplete
+ default:return false
+ }
+}
+struct BackgroundInputOwnerObservation:Decodable {
+ let lease,deadline_valid,foreground_available,passwords_foreground,foreground_same,focused_type_valid,pid_same,role_valid,role_same,element_same,observation_complete:Bool
+ let copy_code,pid_code,role_code:Int
+ var failure:String {
+  if !lease{return "no_lease"};if !deadline_valid{return "deadline"}
+  if !foreground_available{return "foreground_unavailable"};if passwords_foreground{return "passwords_foreground"};if !foreground_same{return "foreground_changed"}
+  if copy_code != 0{return "focused_copy_failed"};if !focused_type_valid{return "focused_type_invalid"}
+  if pid_code != 0{return "focused_pid_failed"};if !pid_same{return "focused_pid_changed"}
+  if role_code != 0 || !role_valid{return "focused_role_failed"};if !role_same{return "focused_role_changed"}
+  if !element_same{return "focused_element_changed"};if !observation_complete{return "observation_incomplete"}
+  return "none"
+ }
+}
+struct BackgroundInputScope:Decodable {
+ let background,owner_exact,unique_index,preimage_exact,two_frames,window_bound,process_verified,note_bound,owned_editor,observation_complete,focus_writable,focus_exact,range_writable,selection_exact,post_access,modifiers_clear,not_attempted,deadline_valid:Bool
+ let phase,role:String;let event_count:Int
+ var permitted:Bool {
+  guard background && owner_exact && unique_index && preimage_exact && two_frames && window_bound && process_verified && note_bound && owned_editor && observation_complete && deadline_valid && ["AXTextField","AXTextArea"].contains(role) else{return false}
+  switch phase {
+  case "focus":return focus_writable && not_attempted
+  case "selection":return focus_exact && range_writable
+  case "unicode":return focus_exact && selection_exact && post_access && modifiers_clear && (0...1).contains(event_count)
+  default:return false
+  }
+ }
+}
+struct BackgroundStrictOwnerLatch {
+ private(set) var failed=false
+ mutating func observe(_ verified:Bool)->Bool {if !verified {failed=true};return !failed}
+}
+struct BackgroundAbsentOwnerScope:Decodable {
+ let selected_text_route,expected_absent,foreground_positive,passwords_background,foreground_same,process_identity_same,complete,two_frames,deadline_valid,value_nil:Bool
+ let copy_code:Int
+ var permitted:Bool {selected_text_route && expected_absent && foreground_positive && passwords_background && foreground_same && process_identity_same && complete && two_frames && deadline_valid && value_nil && copy_code==Int(AXError.noValue.rawValue)}
+}
+struct BackgroundInputCaptureObservation:Decodable {
+ let foreground_available,passwords_background,foreground_same,readonly_phase,lease_absent,not_attempted:Bool
+ var failure:String {
+  if !foreground_available{return "foreground_unavailable"}
+  if !passwords_background{return "passwords_foreground"}
+  if !foreground_same{return "foreground_changed"}
+  if !readonly_phase{return "wrong_phase"}
+  if !lease_absent{return "lease_already_present"}
+  if !not_attempted{return "input_already_attempted"}
+  return "none"
+ }
+}
+func readonlyDetailNavigationOpPermits(_ op:String)->Bool {
+ ["read","deleted-read","deleted-location-read","delete-redundant-note"].contains(op)
+}
+struct BackgroundReadonlyDetailScope:Decodable {
+ let isolated_route,readonly_phase,complete,owner_bound,window_bound,process_bound,unique_fields,identity_static,identity_unwritable,note_role,note_unfocused,selection_unwritable,no_extra_editable,edit_unique_enabled,no_save_cancel,no_sheet,two_frames,objects_equal,content_equal:Bool
+ let password_count:Int
+ var shapePermitted:Bool {(0...1).contains(password_count) && isolated_route && readonly_phase && complete && owner_bound && window_bound && process_bound && unique_fields && identity_static && identity_unwritable && note_role && note_unfocused && selection_unwritable && no_extra_editable && edit_unique_enabled && no_save_cancel && no_sheet}
+ var permitted:Bool {shapePermitted && two_frames && objects_equal && content_equal}
+}
+struct BackgroundSelectedTextScope:Decodable {
+ let background,owner_exact,unique_index,preimage_exact,two_frames,window_bound,process_verified,note_bound,owned_editor,observation_complete,focus_exact,selection_exact,selected_text_writable,not_attempted,deadline_valid:Bool
+ let role,phase:String
+ var permitted:Bool {
+  phase=="strict_mutation" && background && owner_exact && unique_index && preimage_exact && two_frames && window_bound && process_verified && note_bound && owned_editor && observation_complete && focus_exact && selection_exact && selected_text_writable && not_attempted && deadline_valid && ["AXTextField","AXTextArea"].contains(role)
+ }
+}
+struct BackgroundInputActionScope:Decodable {
+ let complete,window_unique,window_same,process_verified,button_unique,button_bound,editor_bound,whole_state_exact,no_sheet,owner_exact,deadline_valid:Bool
+ let role:String
+ var permitted:Bool {complete && window_unique && window_same && process_verified && button_unique && button_bound && editor_bound && whole_state_exact && no_sheet && owner_exact && deadline_valid && role=="AXButton"}
+}
 func sameIndexScope(cachedCategory:String,cachedQuery:String,category:String,query:String)->Bool {
  cachedCategory==category && cachedQuery==query
 }
@@ -402,6 +535,67 @@ if args==["--policy-test"] {
  guard let line=readLine(),let data=line.data(using:.utf8),let q=try? JSONSerialization.jsonObject(with:data) as? [String:Any] else{exit(2)}
  var result:Any
  switch q["operation"] as? String {
+ case "background-notes-input-flags":
+  guard let raw=q["flags"] as? UInt64,let access=notesProbeForegroundFocusOption(q["post_access"]) else{exit(2)}
+  result=backgroundInputFlagsPermit(raw:raw,postAccess:access)
+ case "background-notes-input-phase":
+  result=backgroundInputPhasePermits(phase:q["phase"] as? String ?? "",action:q["action"] as? String ?? "",foregroundSame:q["foreground_same"] as? Bool==true,preimageExact:q["preimage_exact"] as? Bool==true,stateComplete:q["state_complete"] as? Bool==true,strictOwnerExact:q["strict_owner_exact"] as? Bool==true,savedList:q["saved_list"] as? Bool==true)
+ case "background-notes-owner-classification":
+  guard let raw=q["observation"] as? [String:Any],let bytes=try? JSONSerialization.data(withJSONObject:raw),let observation=try? JSONDecoder().decode(BackgroundInputOwnerObservation.self,from:bytes) else{exit(2)}
+  result=observation.failure
+ case "background-notes-input-permission":
+  guard let expected=q["expected"] as? [String:Any],let notes=q["notes"] as? String,let raw=q["scope"] as? [String:Any],
+   let bytes=try? JSONSerialization.data(withJSONObject:raw),let scope=try? JSONDecoder().decode(BackgroundInputScope.self,from:bytes) else{exit(2)}
+  result=notesProbeForegroundFocusOption(q["synthetic_only"])==true && notesProbeForegroundFocusOption(q["background_only"])==true && backgroundInputAppendPermits(expected,notes) && scope.permitted
+ case "initial-index-rescan":
+  guard let raw=q["frames"] as? [[String:Any]],raw.count<=128,let bytes=try? JSONSerialization.data(withJSONObject:raw),let frames=try? JSONDecoder().decode([InitialIndexScanObservation].self,from:bytes) else{exit(2)}
+  var outcome="hold"
+  for (attempt,frame) in frames.prefix(2).enumerated() {
+   let decision=initialIndexScanDecision(frame,attempt:attempt)
+   if decision != "retry" {outcome=decision;break}
+  }
+  result=outcome
+ case "search-clear-initial-owner-boundary":
+  guard let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
+  var witness=SearchClearInitialWitness(),accepted=false
+  for raw in frames {
+   guard witness.observeOwner(ownerSame:raw["owner_same"] as? Bool==true,keyboardSame:raw["keyboard_same"] as? Bool==true) else{break}
+   guard let data=try? JSONSerialization.data(withJSONObject:raw),let frame=try? JSONDecoder().decode(SearchClearInitialObservation.self,from:data) else{exit(2)}
+   let current=witness.observe(frame)
+   guard witness.observeOwner(ownerSame:raw["owner_after"] as? Bool ?? true,keyboardSame:raw["keyboard_after"] as? Bool ?? true) else{break}
+   if current {accepted=true;break}
+  }
+  result=accepted
+ case "search-clear-initial-observation":
+  guard let raw=q["frames"] as? [[String:Any]],raw.count<=128,let data=try? JSONSerialization.data(withJSONObject:raw),let frames=try? JSONDecoder().decode([SearchClearInitialObservation].self,from:data) else{exit(2)}
+  var witness=SearchClearInitialWitness();result=frames.contains{witness.observe($0)}
+ case "readonly-detail-navigation-operation":
+  guard let op=q["op"] as? String else{exit(2)}
+  result=readonlyDetailNavigationOpPermits(op)
+ case "ordinary-notes-append":
+  guard let expected=q["expected"] as? [String:Any],let notes=q["notes"] as? String else{exit(2)}
+  result=ordinaryNotesAppendPermits(expected,notes)
+ case "background-input-phase-owner-latch":
+  guard let frames=q["frames"] as? [[String:Bool]],frames.count<=128 else{exit(2)}
+  var latch=BackgroundStrictOwnerLatch();result=frames.map{latch.observe($0["phase_guard"]==true && $0["owner_bound"]==true) && latch.observe($0["focused"]==true)}
+ case "background-input-owner-latch":
+  guard let frames=q["frames"] as? [Bool],frames.count<=128 else{exit(2)}
+  var latch=BackgroundStrictOwnerLatch();result=frames.map{latch.observe($0)}
+ case "background-input-absent-owner":
+  guard let raw=q["scope"] as? [String:Any],let bytes=try? JSONSerialization.data(withJSONObject:raw),let scope=try? JSONDecoder().decode(BackgroundAbsentOwnerScope.self,from:bytes) else{exit(2)}
+  result=scope.permitted
+ case "background-input-capture-classification":
+  guard let raw=q["scope"] as? [String:Any],let bytes=try? JSONSerialization.data(withJSONObject:raw),let scope=try? JSONDecoder().decode(BackgroundInputCaptureObservation.self,from:bytes) else{exit(2)}
+  result=scope.failure
+ case "background-readonly-detail":
+  guard let raw=q["scope"] as? [String:Any],let bytes=try? JSONSerialization.data(withJSONObject:raw),let scope=try? JSONDecoder().decode(BackgroundReadonlyDetailScope.self,from:bytes) else{exit(2)}
+  result=scope.permitted
+ case "background-notes-selected-text-permission":
+  guard let raw=q["scope"] as? [String:Any],let bytes=try? JSONSerialization.data(withJSONObject:raw),let scope=try? JSONDecoder().decode(BackgroundSelectedTextScope.self,from:bytes) else{exit(2)}
+  result=scope.permitted
+ case "background-notes-input-cleanup":
+  guard let attempted=notesProbeForegroundFocusOption(q["attempted"]) else{exit(2)}
+  result=attempted ? "requires_review":"original_state_recovery_only"
  case "collision-safe-traversal":
   guard let graph=q["nodes"] as? [[String:Any]],graph.count<=6000,let root=q["root"] as? Int,
    let maxDepth=q["max_depth"] as? Int,(1...24).contains(maxDepth),let maxNodes=q["max_nodes"] as? Int,(1...6000).contains(maxNodes) else{exit(2)}
@@ -621,6 +815,7 @@ func safeBackgroundOwner(_ original:pid_t)->Bool {
  return permitsBackgroundOwner(BackgroundOwnerObservation(original_foreground:original,current_foreground:NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0,passwords_pid:passwords,keyboard_pid:keyboard,deadline_valid:Date()<deadline,input_events:false,focus_setter:false,selected_text_setter:false,app_activation:false))
 }
 func front()->Bool {
+ if backgroundInputOriginalPID != nil {return backgroundInputPhaseOwnerUnchanged()}
  // A nil system-wide keyboard observation is not a foreign PID. This
  // synthetic-only lease requires positive focus evidence from Passwords
  // itself into the previously verified exact window on every owner check.
@@ -834,21 +1029,60 @@ func selectionDiagnostics(_ root:AXUIElement)->[String:Any] {
  }
  return result
 }
-func context(_ root:AXUIElement)->(AXUIElement,AXUIElement)? {
- let all=nodes(root);guard front(),!all.contains(where:{text($0,kAXRoleAttribute)=="AXSheet"}),!(button(all,["保存","Save","完成","Done"]) != nil && button(all,["取消","Cancel"]) != nil) else{return nil}
+func context(_ root:AXUIElement,ownerGuard:((Bool)->Bool)?=nil)->(AXUIElement,AXUIElement)? {
+ let all=nodes(root),ownerValid=front();guard ownerGuard?(ownerValid) ?? ownerValid,!all.contains(where:{text($0,kAXRoleAttribute)=="AXSheet"}),!(button(all,["保存","Save","完成","Done"]) != nil && button(all,["取消","Cancel"]) != nil) else{return nil}
  let f=all.filter{text($0,kAXRoleAttribute)=="AXToolbar"}.flatMap{nodes($0)}.filter{text($0,kAXRoleAttribute)=="AXTextField" && text($0,kAXSubroleAttribute)=="AXSearchField"}
  let lists=all.filter{["AXOutline","AXTable"].contains(text($0,kAXRoleAttribute)) && text($0,kAXIdentifierAttribute)=="AccountListView"}
  return f.count==1 && lists.count==1 ? (f[0],lists[0]):nil
 }
-func awaitReadonlyListObservation<T>(_ root:AXUIElement,_ observation:(AXUIElement,AXUIElement)->T?)throws->T {
+var readonlyDetailNavigationAllowed=false
+struct BackgroundReadonlyDetailObservation {
+ let window:AXUIElement;let fields:[AXUIElement];let edit:AXUIElement;let contentHash:String;let passwordCount:Int
+ func sameObjects(_ previous:BackgroundReadonlyDetailObservation)->Bool {
+  CFEqual(window,previous.window) && CFEqual(edit,previous.edit) && passwordCount==previous.passwordCount && fields.count==previous.fields.count && zip(fields,previous.fields).allSatisfy{CFEqual($0.0,$0.1)}
+ }
+}
+func backgroundReadonlyDetail(_ ns:[AXUIElement],_ window:AXUIElement,ownerCheck:(()->Bool)?=nil)->BackgroundReadonlyDetailObservation? {
+ guard (backgroundInputOriginalPID != nil || readonlyDetailNavigationAllowed),["readonly_preimage","readonly_postimage"].contains(backgroundInputLeasePhase),ownEditor==nil else{return nil}
+ let names=["保存","Save","完成","Done","取消","Cancel"]
+ guard !ns.contains(where:{["AXTextField","AXTextArea","AXComboBox"].contains(text($0,kAXRoleAttribute)) && text($0,kAXIdentifierAttribute) != "NotesField" && text($0,kAXSubroleAttribute) != "AXSearchField"}), !ns.contains(where:{text($0,kAXRoleAttribute)=="AXSheet"}),
+  !ns.contains(where:{text($0,kAXRoleAttribute)=="AXButton" && !inSearchField($0) && (names.contains(text($0,kAXTitleAttribute)) || names.contains(text($0,kAXDescriptionAttribute)))}),
+  let edit=button(ns,["编辑","Edit","编辑密码","Edit Password","编辑备注","Edit Note"]),notesProbeForegroundFocusOption(attr(edit,kAXEnabledAttribute))==true,
+  backgroundInputActionWindowBound(edit,window) else{return nil}
+ var bound:[AXUIElement]=[],contents:[[UInt16]]=[]
+ for id in ["TitleField","UserNameField","PasswordField","NotesField"] {
+  let fields=ns.filter{text($0,kAXIdentifierAttribute)==id}
+  if id=="PasswordField",fields.isEmpty {continue}
+  guard fields.count==1,backgroundInputActionWindowBound(fields[0],window),let value=attr(fields[0],kAXValueAttribute) as? String else{return nil}
+  let field=fields[0],role=text(field,kAXRoleAttribute)
+  if id=="NotesField" {
+   guard role=="AXTextField",notesProbeForegroundFocusOption(attr(field,kAXEnabledAttribute))==true,notesProbeForegroundFocusOption(attr(field,kAXFocusedAttribute))==false else{return nil}
+   for name in [kAXSelectedTextAttribute,kAXSelectedTextRangeAttribute] {
+    var settable=DarwinBoolean(false);let code=AXUIElementIsAttributeSettable(field,name as CFString,&settable);observeNativeError(code,required:true)
+    guard code == .success,!settable.boolValue else{return nil}
+   }
+  } else {
+   guard role=="AXStaticText" else{return nil}
+   var settable=DarwinBoolean(false);let code=AXUIElementIsAttributeSettable(field,kAXValueAttribute as CFString,&settable);observeNativeError(code,required:true)
+   guard code == .success,!settable.boolValue else{return nil}
+  }
+  bound.append(field);contents.append(Array(value.utf16))
+ }
+ guard let bytes=try? JSONSerialization.data(withJSONObject:contents),!nativeObservationIncomplete,(ownerCheck?() ?? (backgroundInputOriginalPID != nil ? backgroundInputPhaseOwnerUnchanged():front())) else{return nil}
+ return BackgroundReadonlyDetailObservation(window:window,fields:bound,edit:edit,contentHash:digest(bytes),passwordCount:ns.filter{text($0,kAXIdentifierAttribute)=="PasswordField"}.count)
+}
+func awaitReadonlyListObservation<T>(_ root:AXUIElement,frameGuard:((Bool)->Bool)?=nil,_ observation:(AXUIElement,AXUIElement)->T?)throws->T {
  let requestDeadline=deadline,until=min(deadline,Date(timeIntervalSinceNow:3))
  deadline=until;defer{deadline=requestDeadline}
- while Date()<until,front() {
-  if let observed=completeDiscovery({()->T? in
-   guard let (search,list)=context(root),let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,
+ func ownerCheck()->Bool {let valid=front();return frameGuard?(valid) ?? valid}
+ var previousDetail:BackgroundReadonlyDetailObservation?
+ while Date()<until,ownerCheck() {
+  let observed=completeDiscovery {()->(T,BackgroundReadonlyDetailObservation?)? in
+   guard let (search,list)=context(root,ownerGuard:frameGuard),let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,
     text(windows[0],kAXSubroleAttribute)=="AXStandardWindow" else{return nil}
    let ns=nodes(root)
    let noEditor = !ns.contains{["TitleField","UserNameField","PasswordField","NotesField"].contains(text($0,kAXIdentifierAttribute)) && ["AXTextField","AXTextArea","AXComboBox"].contains(text($0,kAXRoleAttribute))}
+   let detail=noEditor ? nil:backgroundReadonlyDetail(ns,windows[0],ownerCheck:frameGuard==nil ? nil:ownerCheck)
    let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
    var processBound=running.count==1 && running[0].processIdentifier==appPID && apple(appPID)
    for element in [root,windows[0],search,list] {
@@ -857,17 +1091,26 @@ func awaitReadonlyListObservation<T>(_ root:AXUIElement,_ observation:(AXUIEleme
     processBound=processBound && code == .success && pid==appPID
    }
    let windowBound=notesProbeAncestorBound(search,windows[0]) && notesProbeAncestorBound(list,windows[0])
-   guard readonlyContextObservationPermits(complete:!nativeObservationIncomplete,contextAvailable:true,ownerUnchanged:front(),windowBound:windowBound,
-    processBound:processBound,noEditor:noEditor,deadlineValid:Date()<until) else{return nil}
-   return observation(search,list)
-  }),let value=observed {
-   guard Date()<until,front() else{break}
-   return value
+   guard readonlyContextObservationPermits(complete:!nativeObservationIncomplete,contextAvailable:true,ownerUnchanged:ownerCheck(),windowBound:windowBound,
+    processBound:processBound,noEditor:noEditor || detail != nil,deadlineValid:Date()<until),let value=observation(search,list) else{return nil}
+   return (value,detail)
   }
+  guard ownerCheck() else{break}
+  if let frame=observed ?? nil {
+   guard Date()<until,ownerCheck() else{break}
+   if let detail=frame.1 {
+    if let previous=previousDetail {
+     let proof=BackgroundReadonlyDetailScope(isolated_route:backgroundInputOriginalPID != nil || readonlyDetailNavigationAllowed,readonly_phase:["readonly_preimage","readonly_postimage"].contains(backgroundInputLeasePhase),complete:true,owner_bound:ownerCheck(),window_bound:true,process_bound:true,unique_fields:true,identity_static:true,identity_unwritable:true,note_role:true,note_unfocused:true,selection_unwritable:true,no_extra_editable:true,edit_unique_enabled:true,no_save_cancel:true,no_sheet:true,two_frames:true,objects_equal:detail.sameObjects(previous),content_equal:detail.contentHash==previous.contentHash,password_count:detail.passwordCount)
+     if proof.permitted {return frame.0}
+    }
+    previousDetail=detail
+   } else{return frame.0}
+  } else{previousDetail=nil}
   pause(0.04)
  }
  throw nativeFailure("context_observation_unverified")
 }
+
 func query(_ previous:AXUIElement,_ q:String)->Bool { context(AXUIElementCreateApplication(appPID)).map { text($0.0,kAXValueAttribute)==boundQuery } ?? false }
 func fields(_ ns:[AXUIElement])->[String:String] {
  var result:[String:String]=[:]
@@ -1110,7 +1353,7 @@ func cancel(_ root:AXUIElement,_ n:NativeRead,actionGuard:(()->Bool)?=nil)->Bool
   return cancelButton
  }),let b=observed,boundedClick(b,root) else{return false}
  guard waitForList(root) else{return false}
- if let (ownedRoot,_)=ownEditor,CFEqual(root,ownedRoot) {ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false;ownSyntheticInputAttempted=false}
+ if let (ownedRoot,_)=ownEditor,CFEqual(root,ownedRoot) {ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false;ownSyntheticInputAttempted=false;ownBackgroundInputAttempted=false}
  return true
 }
 
@@ -1351,6 +1594,11 @@ func acquireRequestLease()throws {
  // drain it before capturing a new request's owner, instead of retaining the
  // owner from the first request for the entire pipe session.
  _=NSWorkspace.shared;pause(0.01)
+ if let owner=backgroundInputOwner {
+  try require(backgroundInputOwnerUnchanged(),"background_input_owner_changed")
+  backgroundOwnerPID=owner.foreground;backgroundUnsafeFocusObserved=false
+  report["request_owner_mode"]="background";return
+ }
  if foregroundNotesProbeWindow != nil {
   try require(front(),"passwords_foreground_required")
   backgroundOwnerPID=nil;backgroundUnsafeFocusObserved=false
@@ -1369,6 +1617,7 @@ func acquireRequestLease()throws {
  report["request_owner_mode"]=mode
 }
 func closeOwnEditor() {
+ if ownBackgroundInputAttempted {report["background_input_editor_requires_review"]=true;return}
  // Save may already have returned to the list when its independent reread
  // fails. Unknown ownership is still an uncertain attempted mutation.
  if ownSyntheticInputAttempted {
@@ -1714,13 +1963,44 @@ func recoverSearchClear(_ root:AXUIElement,old:String,owner:pid_t?,keyboard:pid_
  }
 }
 func clearSearchQuery(_ root:AXUIElement)->Bool {
+ report["search_clear_initial_stage"]="context_wait";report["search_clear_initial_raw_count"] = -1;report["search_clear_initial_observations"]=0
+ for key in ["search_clear_initial_context_seen","search_clear_initial_owner_same","search_clear_initial_keyboard_same","search_clear_initial_query_read","search_clear_initial_rows_read","search_clear_initial_category_matches","search_clear_initial_frame_complete"] {report[key]=false}
  let owner=NSWorkspace.shared.frontmostApplication?.processIdentifier,keyboard=focusPID()
- guard let initial=completeDiscovery({()->(AXUIElement,String,SearchPreparationFrame)? in
-  guard let (field,list)=context(root),let old=attr(field,kAXValueAttribute) as? String,let rows=attr(list,kAXRowsAttribute) as? [AXUIElement] else{return nil}
-  let category=categoryEvidence(root,currentCategory)
-  let frame=SearchPreparationFrame(complete:true,queryMatches:old.isEmpty,categoryMatches:category.0,ownerUnchanged:front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard,rawCount:rows.count,publishedCount:category.1 ?? -1,labels:[],targetPresent:false)
+ // A post-save list transition may invalidate only this discovery frame.
+ // Reuse the bounded complete context observation; never replay a query or
+ // category action, or accept an owner that changed and later returned.
+ var initialWitness=SearchClearInitialWitness()
+ let initial:(AXUIElement,String,SearchPreparationFrame)?=try? awaitReadonlyListObservation(root,frameGuard:{currentFront in
+  let ownerSame=currentFront && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner,keyboardSame=focusPID()==keyboard
+  report["search_clear_initial_owner_same"]=ownerSame;report["search_clear_initial_keyboard_same"]=keyboardSame
+  let permitted=initialWitness.observeOwner(ownerSame:ownerSame,keyboardSame:keyboardSame)
+  if !permitted {report["search_clear_initial_stage"]="owner_hold"}
+  return permitted
+ }){field,list in
+  report["search_clear_initial_context_seen"]=true;report["search_clear_initial_stage"]="field_wait"
+  report["search_clear_initial_observations"]=min(3000,(report["search_clear_initial_observations"] as? Int ?? 0)+1)
+  for key in ["search_clear_initial_query_read","search_clear_initial_rows_read","search_clear_initial_category_matches","search_clear_initial_frame_complete"] {report[key]=false}
+  report["search_clear_initial_raw_count"] = -1
+  let ownerSame=NSWorkspace.shared.frontmostApplication?.processIdentifier==owner,keyboardSame=focusPID()==keyboard
+  if !ownerSame || !keyboardSame {
+   report["search_clear_initial_stage"]="owner_hold"
+   _=initialWitness.observe(SearchClearInitialObservation(complete:false,context_available:true,owner_same:ownerSame,keyboard_same:keyboardSame,category_matches:false,query_read:false,rows_read:false,deadline_valid:Date()<deadline,raw_count:-1))
+   return nil
+  }
+  let value=attr(field,kAXValueAttribute) as? String;report["search_clear_initial_query_read"]=value != nil
+  guard let old=value else{return nil}
+  let currentRows=attr(list,kAXRowsAttribute) as? [AXUIElement];report["search_clear_initial_rows_read"]=currentRows != nil
+  guard let rows=currentRows else{return nil}
+  report["search_clear_initial_raw_count"]=min(3000,rows.count)
+  let category=categoryEvidence(root,currentCategory),ownerValid=front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner,keyboardValid=focusPID()==keyboard
+  let proof=SearchClearInitialObservation(complete:!nativeObservationIncomplete,context_available:true,owner_same:ownerValid,keyboard_same:keyboardValid,category_matches:category.0,query_read:true,rows_read:true,deadline_valid:Date()<deadline,raw_count:rows.count)
+  report["search_clear_initial_category_matches"]=proof.category_matches;report["search_clear_initial_frame_complete"]=proof.complete
+  report["search_clear_initial_stage"]=proof.category_matches ? (proof.complete ? "complete":"frame_incomplete"):"category_wait"
+  guard initialWitness.observe(proof) else{return nil}
+  let frame=SearchPreparationFrame(complete:true,queryMatches:old.isEmpty,categoryMatches:category.0,ownerUnchanged:true,rawCount:rows.count,publishedCount:category.1 ?? -1,labels:[],targetPresent:false)
   return (field,old,frame)
- }),let (field,old,initialFrame)=initial else{return false}
+ }
+ guard let (field,old,initialFrame)=initial else{return false}
  guard initialFrame.categoryMatches,initialFrame.ownerUnchanged,initialFrame.rawCount>=0,initialFrame.rawCount<=3000 else{return false}
  let cached=currentCategory=="deleted" ? deletedLabels?.count:activeLabels?.count
  let route=searchClearPreparationRoute(initialFrame,queryEmpty:old.isEmpty,cachedRawCount:cached ?? -1,modelNeedsProof:searchModelNeedsProof,background:backgroundOwnerPID != nil)
@@ -1910,28 +2190,32 @@ func awaitDeletedExpectedArrival(_ root:AXUIElement,_ key:[String:String])throws
  }
  throw nativeFailure("deleted_arrival_unverified")
 }
-func currentCategoryIndexFrame(_ root:AXUIElement,_ category:String,withLabels:Bool=true)->CurrentCategoryIndexFrame? {
+var lastCategoryIndexFrameIncomplete=false
+func currentCategoryIndexFrame(_ root:AXUIElement,_ category:String,withLabels:Bool=true,ownerGuard:((Bool)->Bool)?=nil)->CurrentCategoryIndexFrame? {
+ lastCategoryIndexFrameIncomplete=false
+ func ownerCheck()->Bool {let valid=front();return ownerGuard?(valid) ?? valid}
  guard let observed=completeDiscovery({()->CurrentCategoryIndexFrame? in
-  guard !searchModelNeedsProof,front(),currentCategory==category,let (search,list)=context(root),
+  defer{lastCategoryIndexFrameIncomplete=nativeObservationIncomplete}
+  guard !searchModelNeedsProof,ownerCheck(),currentCategory==category,let (search,list)=context(root,ownerGuard:ownerGuard),
    let query=attr(search,kAXValueAttribute) as? String,query.isEmpty,
    let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=3000,
    let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,
    text(windows[0],kAXSubroleAttribute)=="AXStandardWindow",notesProbeAncestorBound(search,windows[0]),notesProbeAncestorBound(list,windows[0]) else{return nil}
   let beforeCategory=categoryEvidence(root,category)
-  var before=CurrentCategoryIndexFrame(complete:true,query_empty:true,category_matches:beforeCategory.0,owner_unchanged:front(),window_bound:true,
+  var before=CurrentCategoryIndexFrame(complete:true,query_empty:true,category_matches:beforeCategory.0,owner_unchanged:ownerCheck(),window_bound:true,
    raw_count:rows.count,published_count:beforeCategory.1 ?? -1,labels:[])
   before.bindings=[search,list,windows[0]]+rows
   guard before.structureVerified else{return nil}
   let labels=withLabels ? rows.map{rowValues($0)}:[]
   // Reading a retained row array is not reading the current model. Rebind
   // after every complete scan and refuse replacement/reordering mid-frame.
-  guard let (freshSearch,freshList)=context(root),let freshQuery=attr(freshSearch,kAXValueAttribute) as? String,freshQuery.isEmpty,
+  guard let (freshSearch,freshList)=context(root,ownerGuard:ownerGuard),let freshQuery=attr(freshSearch,kAXValueAttribute) as? String,freshQuery.isEmpty,
    let freshRows=attr(freshList,kAXRowsAttribute) as? [AXUIElement],freshRows.count<=3000,
    let freshWindows=attr(root,kAXWindowsAttribute) as? [AXUIElement],freshWindows.count==1,
    text(freshWindows[0],kAXSubroleAttribute)=="AXStandardWindow",notesProbeAncestorBound(freshSearch,freshWindows[0]),notesProbeAncestorBound(freshList,freshWindows[0]),
-   front(),currentCategory==category,!searchModelNeedsProof else{return nil}
+   ownerCheck(),currentCategory==category,!searchModelNeedsProof else{return nil}
   let afterCategory=categoryEvidence(root,category)
-  var after=CurrentCategoryIndexFrame(complete:true,query_empty:true,category_matches:afterCategory.0,owner_unchanged:front(),window_bound:true,
+  var after=CurrentCategoryIndexFrame(complete:true,query_empty:true,category_matches:afterCategory.0,owner_unchanged:ownerCheck(),window_bound:true,
    raw_count:freshRows.count,published_count:afterCategory.1 ?? -1,labels:labels)
   after.bindings=[freshSearch,freshList,freshWindows[0]]+freshRows
   guard categoryModelPairPermits(before,after,referencesSame:categoryModelReferencesSame(before,after)) else{return nil}
@@ -2012,7 +2296,24 @@ func selectCategory(_ root:AXUIElement,_ category:String,buildIndex:Bool=true)th
  } else {
   try require(!failedIndexCategories.contains(category),"prior_incomplete_index_requires_review")
   failedIndexCategories.insert(category)
-  guard let frame=currentCategoryIndexFrame(root,category),frame.verified else{throw nativeFailure("incomplete_discovery_snapshot")}
+  // A model transition may invalidate the first readonly full scan. A
+  // semantic rejection is not retried, and no navigation/action is replayed.
+  let originalOwner=NSWorkspace.shared.frontmostApplication?.processIdentifier,originalKeyboard=focusPID()
+  var indexOwnerChanged=false
+  func indexOwnerGuard(_ currentFront:Bool)->Bool {
+   if !currentFront || NSWorkspace.shared.frontmostApplication?.processIdentifier != originalOwner || focusPID() != originalKeyboard {indexOwnerChanged=true}
+   return !indexOwnerChanged
+  }
+  var verifiedFrame:CurrentCategoryIndexFrame?
+  for attempt in 0..<2 {
+   guard Date()<deadline,indexOwnerGuard(front()) else{break}
+   let frame=currentCategoryIndexFrame(root,category,ownerGuard:indexOwnerGuard)
+   let decision=initialIndexScanDecision(InitialIndexScanObservation(frame_present:frame != nil,frame_verified:frame?.verified==true,frame_incomplete:lastCategoryIndexFrameIncomplete,owner_valid:indexOwnerGuard(front()),deadline_valid:Date()<deadline),attempt:attempt)
+   if decision=="accept" {verifiedFrame=frame;break}
+   guard decision=="retry" else{break}
+   pause(0.04)
+  }
+  guard let frame=verifiedFrame else{throw nativeFailure("incomplete_discovery_snapshot")}
   let labels=frame.labels
   if category=="active" {activeLabels=labels}else{deletedLabels=labels};indexedLabels=labels
   failedIndexCategories.remove(category)
@@ -2360,16 +2661,61 @@ func notesProbeChildren(_ note:AXUIElement)->[String:Any]? {
  guard walk(note,0) else{return nil}
  return ["count":children.count,"complete":true,"nodes":children]
 }
+// Optional, read-only backing observations. Success/absence is separate from
+// equality; neither a shared relationship nor AX focus authorizes text input.
+func notesProbeTextBacking(_ note:AXUIElement,_ expectedText:String)->[String:Any]? {
+ let optionalErrors:[AXError]=[.attributeUnsupported,.parameterizedAttributeUnsupported,.noValue,.notImplemented]
+ func observed(_ code:AXError) {observeNativeError(code,required:!optionalErrors.contains(code))}
+ func copy(_ name:String)->(AXError,CFTypeRef?) {
+  var value:CFTypeRef?
+  let code=AXUIElementCopyAttributeValue(note,name as CFString,&value);observed(code)
+  return (code,value)
+ }
+ let (numberCode,numberValue)=copy(kAXNumberOfCharactersAttribute)
+ let numberKnown=numberCode == .success && numberValue.map{CFGetTypeID($0)==CFNumberGetTypeID()}==true
+ let countMatches=numberKnown && (numberValue as? Int)==expectedText.utf16.count
+ var range=CFRange(location:0,length:expectedText.utf16.count)
+ guard let rangeValue=AXValueCreate(.cfRange,&range) else{return nil}
+ var textValue:CFTypeRef?
+ let stringCode=AXUIElementCopyParameterizedAttributeValue(note,kAXStringForRangeParameterizedAttribute as CFString,rangeValue,&textValue)
+ observed(stringCode)
+ let stringKnown=stringCode == .success && textValue.map{CFGetTypeID($0)==CFStringGetTypeID()}==true
+ let stringMatches=stringKnown && (textValue as? String)?.utf16.elementsEqual(expectedText.utf16)==true
+ let (focusCode,focusValue)=copy(kAXFocusedAttribute)
+ let focusKnown=focusCode == .success && focusValue.map{CFGetTypeID($0)==CFBooleanGetTypeID()}==true
+ var writable=DarwinBoolean(false)
+ let writableCode=AXUIElementIsAttributeSettable(note,kAXFocusedAttribute as CFString,&writable);observed(writableCode)
+ func shared(_ name:String)->(AXError,Int)? {
+  let (code,value)=copy(name)
+  if optionalErrors.contains(code) {return (code,-1)}
+  guard code == .success,let values=value as? [AXUIElement],values.count<=16 else{return nil}
+  for node in values {var pid:pid_t=0;let pidCode=AXUIElementGetPid(node,&pid);observeNativeError(pidCode,required:true);guard pidCode == .success,pid==appPID else{return nil}}
+  return (code,values.count)
+ }
+ guard let sharedText=shared(kAXSharedTextUIElementsAttribute),let sharedFocus=shared(kAXSharedFocusElementsAttribute) else{return nil}
+ var parameterValues:CFArray?
+ let parameterCode=AXUIElementCopyParameterizedAttributeNames(note,&parameterValues);observed(parameterCode)
+ let allowed:Set<String>=["AXStringForRange","AXAttributedStringForRange","AXBoundsForRange","AXLineForIndex","AXRangeForLine","AXRangeForIndex","AXRTFForRange","AXStyleRangeForIndex","AXTextOperation"]
+ let parameters=(parameterValues as? [String] ?? []).filter{allowed.contains($0)}.sorted()
+ return ["number_code":numberCode.rawValue,"count_known":numberKnown,"count_matches":countMatches,
+  "string_code":stringCode.rawValue,"string_known":stringKnown,"string_matches":stringMatches,
+  "focus_code":focusCode.rawValue,"focus_known":focusKnown,"focus_value":focusKnown && (focusValue as? Bool)==true,
+  "focus_settable_code":writableCode.rawValue,"focus_settable":writableCode == .success && writable.boolValue,
+  "shared_text_code":sharedText.0.rawValue,"shared_text_count":sharedText.1,
+  "shared_focus_code":sharedFocus.0.rawValue,"shared_focus_count":sharedFocus.1,
+  "parameterized_code":parameterCode.rawValue,"parameterized":parameters]
+}
 func notesProbeStructure(_ root:AXUIElement,_ fieldsBefore:[String:String])throws {
  let until=min(deadline,Date(timeIntervalSinceNow:3));var previous:[String:Any]?
  while Date()<until,front() {
   if let observed=completeDiscovery({()->[String:Any]? in
    let ns=nodes(root),matches=ns.filter{text($0,kAXIdentifierAttribute)=="NotesField"}
-   guard matches.count==1,fields(ns)==fieldsBefore,let children=notesProbeChildren(matches[0]) else{return nil}
-   return ["notes_children":children,"notes_internal_focus":notesProbeInternalFocus(root,matches[0])]
+   guard matches.count==1,fields(ns)==fieldsBefore,let children=notesProbeChildren(matches[0]),
+    let expectedText=fieldsBefore["NotesField"],let backing=notesProbeTextBacking(matches[0],expectedText) else{return nil}
+   return ["notes_children":children,"notes_internal_focus":notesProbeInternalFocus(root,matches[0]),"notes_text_backing":backing]
   }),let structure=observed {
    if let previous,NSDictionary(dictionary:previous).isEqual(to:structure),front() {
-    report["notes_children"]=structure["notes_children"];report["notes_internal_focus"]=structure["notes_internal_focus"];return
+    report["notes_children"]=structure["notes_children"];report["notes_internal_focus"]=structure["notes_internal_focus"];report["notes_text_backing"]=structure["notes_text_backing"];return
    }
    previous=structure
   } else {previous=nil}
@@ -2385,10 +2731,11 @@ func ownedNotesProbeRead(_ root:AXUIElement,_ target:Target,_ expected:[String:A
  report["notes_probe_read_opened"]=openedByRead
  let complete=observed.map{n in n.verifiedCanonicalState != nil && n.sitesKnown && ["TitleField","UserNameField","PasswordField","NotesField"].allSatisfy{n.fieldValues[$0] != nil}} ?? false
  func originalOwnerUnchanged()->Bool {
-  foregroundBefore != nil && (keyboardBefore != nil || foregroundNotesProbeWindow != nil) && NSWorkspace.shared.frontmostApplication?.processIdentifier==foregroundBefore && focusPID()==keyboardBefore && front()
+  if backgroundInputOriginalPID != nil {return backgroundInputPhaseOwnerUnchanged()}
+  return foregroundBefore != nil && (keyboardBefore != nil || foregroundNotesProbeWindow != nil) && NSWorkspace.shared.frontmostApplication?.processIdentifier==foregroundBefore && focusPID()==keyboardBefore && front()
  }
  let expectedComplete=editorRecoveryPermits(expected:expected,observed:expected,complete:true,unique:true)
- let initialPolicy=notesProbeReadCleanupPolicy(returnedComplete:complete,openedByRead:openedByRead,ownerUnchanged:originalOwnerUnchanged(),expectedComplete:expectedComplete,listAvailable:false,inputAttempted:ownSyntheticInputAttempted)
+ let initialPolicy=notesProbeReadCleanupPolicy(returnedComplete:complete,openedByRead:openedByRead,ownerUnchanged:originalOwnerUnchanged(),expectedComplete:expectedComplete,listAvailable:false,inputAttempted:ownSyntheticInputAttempted || ownBackgroundInputAttempted)
  if initialPolicy=="register_before_snapshot",let observed {
   // The exact complete editor belongs to this read before snapshot() can
   // throw. Existing readonly cleanup can now close it only if unchanged.
@@ -2396,7 +2743,7 @@ func ownedNotesProbeRead(_ root:AXUIElement,_ target:Target,_ expected:[String:A
   ownNotesProbeExpected=expected;ownNotesProbeCleanupAttempted=false
   return observed
  }
- if initialPolicy=="requires_review",ownSyntheticInputAttempted {
+ if initialPolicy=="requires_review",ownSyntheticInputAttempted || ownBackgroundInputAttempted {
   // A partial post-input read is not a new readonly recovery permission.
   // Preserve any exact editor provenance actually returned by this read;
   // never fabricate complete state or cancel from cached metadata.
@@ -2404,7 +2751,8 @@ func ownedNotesProbeRead(_ root:AXUIElement,_ target:Target,_ expected:[String:A
    ownEditor=(root,observed);ownEditorFields=observed.fieldValues
    ownNotesProbeExpected=expected
   }
-  report["synthetic_input_editor_requires_review"]=true
+  if ownBackgroundInputAttempted {report["background_input_editor_requires_review"]=true}
+  else {report["synthetic_input_editor_requires_review"]=true}
   throw nativeFailure("editor_requires_review")
  }
  let listAvailable=completeDiscovery({context(root) != nil})==true
@@ -2475,7 +2823,7 @@ func notesEditorProbe(_ expected:[String:Any],_ key:[String:String],foregroundFo
  try require(notesProbeOutcomePermits(preimageExact:true,diagnosticsComplete:true,cancelVerified:true,rereadExact:true,finalCancelVerified:cancelled),"notes_probe_final_cancel_unverified")
  report["notes_probe_stage"]="complete"
  var diagnostics:[String:Any]=[:]
- for name in ["notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","focus_requested","focus_settable","focus_set_code","focus_verified"] {if let value=report[name] {diagnostics[name]=value}}
+ for name in ["notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_text_backing","notes_probe_stage","notes_probe_row_count","focus_requested","focus_settable","focus_set_code","focus_verified"] {if let value=report[name] {diagnostics[name]=value}}
  return ["ok":true,"probed":true,"synthetic_only":true,"mutation_authorized":false,"current_cohort_only":true,"credentials_changed":0,"journal_modified":false,"app_activated":false,"foreground_focus":foregroundFocus,"diagnostics":diagnostics]
 }
 func literalNotesStateEqual(_ first:[String:Any],_ second:[String:Any])->Bool {
@@ -2623,6 +2971,345 @@ func syntheticForegroundNotesInput(_ expected:[String:Any],_ key:[String:String]
  return ["ok":true,"synthetic_only":true,"foreground_focus":true,"persisted":true,"credentials_changed":1,
   "app_activated":false,"exports":0,"imports":0,"state":state,"diagnostics":diagnostics]
 }
+func backgroundInputActionWindowBound(_ element:AXUIElement,_ window:AXUIElement)->Bool {
+ var current=element,seen=nativeVisited()
+ for _ in 0..<16 {
+  guard Date()<deadline,seen.insert(current) else{return false}
+  var pid:pid_t=0
+  let pidCode=AXUIElementGetPid(current,&pid);observeNativeError(pidCode,required:true)
+  guard pidCode == .success,pid==appPID else{return false}
+  let role=text(current,kAXRoleAttribute),identifier=text(current,kAXIdentifierAttribute),subrole=text(current,kAXSubroleAttribute)
+  guard !["AXSheet","AXOutline","AXTable","AXRow"].contains(role),identifier != "SearchField",subrole != kAXSearchFieldSubrole else{return false}
+  if CFEqual(current,window) {return role=="AXWindow" && subrole=="AXStandardWindow"}
+  var parentValue:CFTypeRef?
+  let parentCode=AXUIElementCopyAttributeValue(current,kAXParentAttribute as CFString,&parentValue);observeNativeError(parentCode,required:true)
+  guard parentCode == .success,let parentValue,CFGetTypeID(parentValue)==AXUIElementGetTypeID() else{return false}
+  let parent=unsafeBitCast(parentValue,to:AXUIElement.self)
+  var childValue:CFTypeRef?
+  let childCode=AXUIElementCopyAttributeValue(parent,kAXChildrenAttribute as CFString,&childValue);observeNativeError(childCode,required:true)
+  guard childCode == .success,let children=childValue as? [AXUIElement],children.count<=6000,
+   children.filter({CFEqual($0,current)}).count==1 else{return false}
+  current=parent
+ }
+ return false
+}
+func backgroundInputAction(_ root:AXUIElement,_ key:[String:String],_ wanted:[String:Any],_ expectedRaw:[String:String],_ window:AXUIElement,names:[String])throws->AXUIElement {
+ let isCancel=names==["取消","Cancel"]
+ try require(backgroundInputPhasePermits(phase:backgroundInputLeasePhase,action:isCancel ? "cancel":"save",foregroundSame:NSWorkspace.shared.frontmostApplication?.processIdentifier==backgroundInputOriginalPID,preimageExact:true,stateComplete:true,strictOwnerExact:backgroundInputLeasePhase=="strict_mutation" && backgroundInputOwnerUnchanged(),savedList:false),"background_input_action_phase_refused")
+ let observed=completeDiscovery {()->AXUIElement? in
+  guard backgroundInputPhaseOwnerUnchanged(),Date()<deadline,
+   let current=try? observeReadonlyEditor(root,key),literalNotesStateEqual(current.1,wanted),current.0.fieldValues==expectedRaw,
+   ownEditor.map({CFEqual($0.0,root)})==true,
+   let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,
+   text(windows[0],kAXSubroleAttribute)=="AXStandardWindow",CFEqual(windows[0],window),
+   !current.0.editor.contains(where:{text($0,kAXRoleAttribute)=="AXSheet"}),let action=button(current.0.editor,names) else{return nil}
+  let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
+  guard running.count==1,running[0].processIdentifier==appPID,apple(appPID) else{return nil}
+  for element in [root,windows[0],action] {
+   var pid:pid_t=0;let code=AXUIElementGetPid(element,&pid);observeNativeError(code,required:true)
+   guard code == .success,pid==appPID else{return nil}
+  }
+  let editorBound=["TitleField","UserNameField","PasswordField","NotesField"].allSatisfy { id in
+   let matches=current.0.editor.filter{text($0,kAXIdentifierAttribute)==id && ["AXTextField","AXTextArea","AXComboBox"].contains(text($0,kAXRoleAttribute))}
+   return matches.count==1 && backgroundInputActionWindowBound(matches[0],window)
+  }
+  let buttonBound=backgroundInputActionWindowBound(action,window)
+  var actions:CFArray?
+  let actionsCode=AXUIElementCopyActionNames(action,&actions);observeNativeError(actionsCode,required:true)
+  guard actionsCode == .success,let actionNames=actions as? [String],actionNames.count<=16,actionNames.contains(kAXPressAction) else{return nil}
+  let scope=BackgroundInputActionScope(complete:!nativeObservationIncomplete,window_unique:true,window_same:CFEqual(windows[0],window),process_verified:true,button_unique:true,button_bound:buttonBound,editor_bound:editorBound,whole_state_exact:literalNotesStateEqual(current.1,wanted) && current.0.fieldValues==expectedRaw,no_sheet:true,owner_exact:backgroundInputPhaseOwnerUnchanged(),deadline_valid:Date()<deadline,role:text(action,kAXRoleAttribute))
+  return scope.permitted ? action:nil
+ }
+ guard let action=observed ?? nil else{throw nativeFailure("background_input_action_scope_unverified")}
+ return action
+}
+let backgroundInputDiagnosticKeys=["background_input_owner_kind","background_input_capture_failure","background_input_selected_text_attempted","background_input_selected_text_settable","background_input_selected_text_code","background_input_stage","background_input_focus_attempted","background_input_focus_code","background_input_focus_verified","background_input_range_attempted","background_input_range_code","background_input_selection_verified","background_input_event_count","background_input_save_attempted","background_input_postimage_verified","background_input_persisted_verified","background_input_editor_requires_review","background_input_owner_verified","background_input_owner_failure","background_input_owner_copy_code","background_input_owner_pid_code","background_input_owner_role_code","background_input_owner_foreground_same","background_input_owner_pid_same","background_input_owner_role_same","background_input_owner_element_same","background_input_owner_frame_complete","background_input_focus_scope_verified","background_input_post_gate","background_input_post_access","background_input_modifiers_clear","background_input_modifier_flags","background_input_permission_phase","background_input_permission_verified","background_input_permission_scope"]
+struct BackgroundForegroundIdentity:Equatable {let foreground:pid_t;let launchDate:Date;let executable:URL;let bundle:String?}
+func backgroundForegroundIdentity(_ pid:pid_t)->BackgroundForegroundIdentity? {
+ guard pid>0,let app=NSRunningApplication(processIdentifier:pid),!app.isTerminated,app.processIdentifier==pid,
+  let launch=app.launchDate,let executable=app.executableURL else{return nil}
+ return BackgroundForegroundIdentity(foreground:pid,launchDate:launch,executable:executable,bundle:app.bundleIdentifier)
+}
+struct BackgroundInputOwner {
+ let foreground:pid_t;let element:AXUIElement?;let role:String;let identity:BackgroundForegroundIdentity
+ var kind:String {element==nil ? "absent":"present"}
+}
+var backgroundInputOwner:BackgroundInputOwner?
+var backgroundInputStrictOwnerLatch=BackgroundStrictOwnerLatch()
+var backgroundInputOriginalPID:pid_t?
+var backgroundInputLeasePhase="readonly_preimage"
+func backgroundInputPhaseOwnerUnchanged()->Bool {
+ let original=backgroundInputOriginalPID ?? 0,current=NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+ let phaseScope=original>0 && original != appPID && Date()<deadline && current==original
+ if backgroundInputLeasePhase=="strict_mutation" {
+  guard !backgroundInputStrictOwnerLatch.failed else{return false}
+  let verified=phaseScope && backgroundInputOwner?.foreground==original
+  if !verified {
+   report["background_input_owner_verified"]=false;report["background_input_owner_foreground_same"]=current==original
+   report["background_input_owner_failure"] = original<=0 || backgroundInputOwner?.foreground != original ? "no_lease":(Date()>=deadline ? "deadline":(current==appPID ? "passwords_foreground":"foreground_changed"))
+  }
+  guard backgroundInputStrictOwnerLatch.observe(verified) else{return false}
+  return backgroundInputOwnerUnchanged()
+ }
+ guard phaseScope,["readonly_preimage","readonly_postimage"].contains(backgroundInputLeasePhase),backgroundInputOwner==nil else{return false}
+ return safeBackgroundOwner(original)
+}
+var ownBackgroundInputAttempted=false
+func backgroundInputOwnerUnchanged()->Bool {
+ guard !backgroundInputStrictOwnerLatch.failed else{return false}
+ let currentForeground=NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+ guard let owner=backgroundInputOwner else{report["background_input_owner_failure"]="no_lease";report["background_input_owner_verified"]=false;if backgroundInputLeasePhase=="strict_mutation" {_=backgroundInputStrictOwnerLatch.observe(false)};return false}
+ var copyCode=0,pidCode=0,roleCode=0
+ var typeValid=false,pidSame=false,roleValid=false,roleSame=false,elementSame=false
+ let foregroundSame=currentForeground==owner.foreground
+ let canObserve=Date()<deadline && owner.foreground>0 && owner.foreground != appPID && currentForeground>0 && foregroundSame
+ let proof:Bool?=canObserve ? completeDiscovery {()->Bool in
+  var value:CFTypeRef?,pid:pid_t=0,roleValue:CFTypeRef?
+  guard backgroundForegroundIdentity(owner.foreground)==owner.identity else{return false}
+  let code=AXUIElementCopyAttributeValue(AXUIElementCreateApplication(owner.foreground),kAXFocusedUIElementAttribute as CFString,&value);copyCode=Int(code.rawValue)
+  if owner.kind=="absent" {
+   // The only opt-in non-error is an explicit absent state in this zero-event
+   // exact-field route; noValue with an object is still invalid.
+   if !(code == .noValue && value==nil) {observeNativeError(code,required:true)}
+   let scope=BackgroundAbsentOwnerScope(selected_text_route:true,expected_absent:true,foreground_positive:currentForeground>0,passwords_background:currentForeground != appPID,foreground_same:NSWorkspace.shared.frontmostApplication?.processIdentifier==owner.foreground,process_identity_same:backgroundForegroundIdentity(owner.foreground)==owner.identity,complete:!nativeObservationIncomplete,two_frames:true,deadline_valid:Date()<deadline,value_nil:value==nil,copy_code:copyCode)
+   return scope.permitted
+  }
+  observeNativeError(code,required:true)
+  guard code == .success,let value,CFGetTypeID(value)==AXUIElementGetTypeID() else{return false}
+  typeValid=true
+  let focused=unsafeBitCast(value,to:AXUIElement.self),pidResult=AXUIElementGetPid(focused,&pid);observeNativeError(pidResult,required:true);pidCode=Int(pidResult.rawValue);pidSame=pidResult == .success && pid==owner.foreground
+  guard pidSame else{return false}
+  let roleResult=AXUIElementCopyAttributeValue(focused,kAXRoleAttribute as CFString,&roleValue);observeNativeError(roleResult,required:true);roleCode=Int(roleResult.rawValue)
+  roleValid=roleValue is String;roleSame=roleResult == .success && (roleValue as? String)==owner.role
+  elementSame=owner.element.map{CFEqual(focused,$0)}==true
+  return roleSame && elementSame && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner.foreground
+ }:false
+ let complete=canObserve && proof != nil
+ let finalForeground=NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+ let observation=BackgroundInputOwnerObservation(lease:true,deadline_valid:Date()<deadline,foreground_available:finalForeground>0,passwords_foreground:finalForeground==appPID,foreground_same:foregroundSame && finalForeground==owner.foreground,focused_type_valid:typeValid,pid_same:pidSame,role_valid:roleValid,role_same:roleSame,element_same:elementSame,observation_complete:complete,copy_code:copyCode,pid_code:pidCode,role_code:roleCode)
+ for (key,value) in ["background_input_owner_copy_code":copyCode,"background_input_owner_pid_code":pidCode,"background_input_owner_role_code":roleCode] {report[key]=value}
+ for (key,value) in ["background_input_owner_foreground_same":observation.foreground_same,"background_input_owner_pid_same":pidSame,"background_input_owner_role_same":roleSame,"background_input_owner_element_same":elementSame,"background_input_owner_frame_complete":complete] {report[key]=value}
+ report["background_input_owner_kind"]=owner.kind
+ var failure=observation.failure
+ if owner.kind=="absent" {
+  if !observation.foreground_same {failure="foreground_changed"}
+  else if !canObserve {failure = !foregroundSame ? "foreground_changed":(Date()>=deadline ? "deadline":"foreground_unavailable")}
+  else if backgroundForegroundIdentity(owner.foreground) != owner.identity {failure="focused_pid_changed"}
+  else if copyCode==0 {failure="focused_element_changed"}
+  else if copyCode != Int(AXError.noValue.rawValue) {failure="focused_copy_failed"}
+  else {failure=proof==true ? "none":"observation_incomplete"}
+ }
+ report["background_input_owner_failure"]=failure
+ let ok=proof==true && failure=="none";report["background_input_owner_verified"]=ok
+ return backgroundInputLeasePhase=="strict_mutation" ? backgroundInputStrictOwnerLatch.observe(ok):ok
+}
+func beginBackgroundInputLease(_ expectedForeground:pid_t)throws {
+ _=NSWorkspace.shared;pause(0.01)
+ let capturedForeground=NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0
+ let capture=BackgroundInputCaptureObservation(foreground_available:capturedForeground>0,passwords_background:capturedForeground>0 && capturedForeground != appPID,foreground_same:capturedForeground==expectedForeground,readonly_phase:backgroundInputLeasePhase=="readonly_preimage",lease_absent:backgroundInputOwner==nil,not_attempted:!ownBackgroundInputAttempted)
+ report["background_input_capture_failure"]=capture.failure;report["background_input_owner_foreground_same"]=capture.foreground_same
+ guard capture.failure=="none" else{throw nativeFailure("background_input_background_required")}
+ let foreground=capturedForeground
+ guard let identity=backgroundForegroundIdentity(foreground) else{throw nativeFailure("background_input_owner_unavailable")}
+ func captureFocusedState()->BackgroundInputOwner? {
+  let observed=completeDiscovery {()->BackgroundInputOwner? in
+   guard NSWorkspace.shared.frontmostApplication?.processIdentifier==foreground,backgroundForegroundIdentity(foreground)==identity else{return nil}
+   var value:CFTypeRef?,pid:pid_t=0
+   let code=AXUIElementCopyAttributeValue(AXUIElementCreateApplication(foreground),kAXFocusedUIElementAttribute as CFString,&value)
+   if code == .noValue,value==nil {
+    guard NSWorkspace.shared.frontmostApplication?.processIdentifier==foreground,backgroundForegroundIdentity(foreground)==identity else{return nil}
+    return BackgroundInputOwner(foreground:foreground,element:nil,role:"",identity:identity)
+   }
+   observeNativeError(code,required:true)
+   guard code == .success,let value,CFGetTypeID(value)==AXUIElementGetTypeID() else{return nil}
+   let element=unsafeBitCast(value,to:AXUIElement.self),pidCode=AXUIElementGetPid(element,&pid);observeNativeError(pidCode,required:true)
+   let role=text(element,kAXRoleAttribute)
+   guard pidCode == .success,pid==foreground,["AXWindow","AXTextField","AXTextArea","AXButton","AXGroup","AXScrollArea","AXWebArea","AXOutline","AXTable","AXComboBox","AXPopUpButton","AXCheckBox","AXRadioButton","AXApplication"].contains(role),NSWorkspace.shared.frontmostApplication?.processIdentifier==foreground,backgroundForegroundIdentity(foreground)==identity else{return nil}
+   return BackgroundInputOwner(foreground:foreground,element:element,role:role,identity:identity)
+  }
+  return observed ?? nil
+ }
+ guard let owner=captureFocusedState() else{throw nativeFailure("background_input_owner_unavailable")}
+ if owner.kind=="absent" {
+  pause(0.04)
+  guard let second=captureFocusedState(),second.kind=="absent",second.identity==owner.identity,
+   second.foreground==owner.foreground,Date()<deadline else{throw nativeFailure("background_input_owner_unavailable")}
+ }
+ report["background_input_owner_kind"]=owner.kind
+ try require(backgroundInputPhasePermits(phase:backgroundInputLeasePhase,action:"capture",foregroundSame:NSWorkspace.shared.frontmostApplication?.processIdentifier==expectedForeground,preimageExact:true,stateComplete:true,strictOwnerExact:false,savedList:false),"background_input_capture_phase_refused")
+ backgroundInputOwner=owner;backgroundOwnerPID=foreground;backgroundUnsafeFocusObserved=false;backgroundInputLeasePhase="strict_mutation"
+ try require(backgroundInputOwnerUnchanged(),"background_input_owner_changed")
+}
+struct BackgroundInputEditorFrame {let read:NativeRead;let state:[String:Any];let note,window:AXUIElement}
+func backgroundInputFrame(_ root:AXUIElement,_ key:[String:String],_ original:[String:Any],_ intended:[String:Any],_ raw:[String:String],window:AXUIElement?=nil,note:AXUIElement?=nil,focused:Bool=false,allowIntended:Bool=false)throws->BackgroundInputEditorFrame {
+ let observed=completeDiscovery {()->BackgroundInputEditorFrame? in
+  guard backgroundInputPhaseOwnerUnchanged(),let current=try? observeReadonlyEditor(root,key),
+   literalNotesStateEqual(current.1,original) || (allowIntended && literalNotesStateEqual(current.1,intended)),
+   current.0.fieldValues.filter({$0.key != "NotesField"})==raw.filter({$0.key != "NotesField"}),
+   let currentNote=notesProbeCurrentNote(current.0),let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,
+   text(windows[0],kAXSubroleAttribute)=="AXStandardWindow",window.map({CFEqual($0,windows[0])}) ?? true,
+   note.map({CFEqual($0,currentNote)}) ?? true,ownEditor.map({CFEqual($0.0,root)})==true else{return nil}
+  let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
+  guard running.count==1,running[0].processIdentifier==appPID,apple(appPID) else{return nil}
+  for element in [root,windows[0],currentNote] {var pid:pid_t=0;let code=AXUIElementGetPid(element,&pid);observeNativeError(code,required:true);guard code == .success,pid==appPID else{return nil}}
+  let bound=["TitleField","UserNameField","PasswordField","NotesField"].allSatisfy{id in
+   let fields=current.0.editor.filter{text($0,kAXIdentifierAttribute)==id && ["AXTextField","AXTextArea","AXComboBox"].contains(text($0,kAXRoleAttribute))}
+   return fields.count==1 && backgroundInputActionWindowBound(fields[0],windows[0])
+  }
+  guard bound,!focused || notesProbeBoundInternalFocus(root,currentNote,editableOnly:true) != nil,backgroundInputPhaseOwnerUnchanged() else{return nil}
+  return BackgroundInputEditorFrame(read:current.0,state:current.1,note:currentNote,window:windows[0])
+ }
+ guard let frame=observed ?? nil else{throw nativeFailure(focused ? "background_input_receiver_unverified":"background_input_state_unverified")}
+ return frame
+}
+func backgroundInputSettable(_ note:AXUIElement,_ name:String)throws->Bool {
+ try require(backgroundInputLeasePhase=="strict_mutation","background_input_mutation_phase_refused")
+ let proof=completeDiscovery {()->Bool in
+  var allowed=DarwinBoolean(false),pid:pid_t=0
+  let pidCode=AXUIElementGetPid(note,&pid);observeNativeError(pidCode,required:true)
+  let code=AXUIElementIsAttributeSettable(note,name as CFString,&allowed);observeNativeError(code,required:true)
+  if name==kAXSelectedTextRangeAttribute {report["notes_range_code"]=code.rawValue;report["notes_range_settable"]=allowed.boolValue}
+  return pidCode == .success && pid==appPID && code == .success && allowed.boolValue && backgroundInputOwnerUnchanged()
+ }
+ return proof==true
+}
+func backgroundInputPermission(_ frame:BackgroundInputEditorFrame,_ root:AXUIElement,_ expected:[String:Any],_ intended:[String:Any],phase:String,twoFrames:Bool,focusWritable:Bool=false,rangeWritable:Bool=false,selectionExact:Bool=false,eventCount:Int=0)->Bool {
+ guard backgroundInputLeasePhase=="strict_mutation" else{return false}
+ let verified=completeDiscovery {()->Bool in
+  let note=frame.note,role=text(note,kAXRoleAttribute)
+  let validState=literalNotesStateEqual(frame.state,expected) || (phase=="unicode" && eventCount>0 && literalNotesStateEqual(frame.state,intended))
+  let currentScope=ownEditor.map({CFEqual($0.0,root)})==true && ownNotesProbeExpected != nil
+  let labels=indexedLabels ?? [],key=expected["key"] as? [String:String] ?? [:]
+  let unique=matchingNativeLabels(labels,title:key["title"] ?? "",username:key["username"] ?? "").count==1 && indexedCategory=="active" && indexedQuery==boundQuery
+  var pid:pid_t=0;let pidCode=AXUIElementGetPid(note,&pid);observeNativeError(pidCode,required:true)
+  let focused=phase=="focus" ? false:notesProbeBoundInternalFocus(root,note,editableOnly:true) != nil
+  let scope=BackgroundInputScope(background:NSWorkspace.shared.frontmostApplication?.processIdentifier != appPID,owner_exact:backgroundInputOwnerUnchanged(),unique_index:unique,preimage_exact:validState,two_frames:twoFrames,window_bound:backgroundInputActionWindowBound(note,frame.window),process_verified:pidCode == .success && pid==appPID && apple(appPID),note_bound:text(note,kAXIdentifierAttribute)=="NotesField",owned_editor:currentScope,observation_complete:!nativeObservationIncomplete,focus_writable:focusWritable,focus_exact:focused,range_writable:rangeWritable,selection_exact:selectionExact,post_access:false,modifiers_clear:false,not_attempted:!ownBackgroundInputAttempted,deadline_valid:Date()<deadline,phase:phase,role:role,event_count:eventCount)
+  report["background_input_permission_phase"]=phase
+  report["background_input_permission_verified"]=scope.permitted
+  report["background_input_permission_scope"]=["background":scope.background,"owner_exact":scope.owner_exact,"unique_index":scope.unique_index,"preimage_exact":scope.preimage_exact,"two_frames":scope.two_frames,"window_bound":scope.window_bound,"process_verified":scope.process_verified,"note_bound":scope.note_bound,"owned_editor":scope.owned_editor,"observation_complete":scope.observation_complete,"focus_writable":scope.focus_writable,"focus_exact":scope.focus_exact,"range_writable":scope.range_writable,"selection_exact":scope.selection_exact,"post_access":scope.post_access,"modifiers_clear":scope.modifiers_clear,"not_attempted":scope.not_attempted,"deadline_valid":scope.deadline_valid]
+  return scope.permitted
+ }
+ return verified==true
+}
+func backgroundInputSelectedTextPermission(_ frame:BackgroundInputEditorFrame,_ root:AXUIElement,_ expected:[String:Any],twoFrames:Bool,writable:Bool,length:Int)->Bool {
+ let observed=completeDiscovery {()->Bool in
+  let note=frame.note,key=expected["key"] as? [String:String] ?? [:],labels=indexedLabels ?? []
+  let unique=matchingNativeLabels(labels,title:key["title"] ?? "",username:key["username"] ?? "").count==1 && indexedCategory=="active" && indexedQuery==boundQuery
+  var pid:pid_t=0;let pidCode=AXUIElementGetPid(note,&pid);observeNativeError(pidCode,required:true)
+  let scope=BackgroundSelectedTextScope(background:NSWorkspace.shared.frontmostApplication?.processIdentifier != appPID,owner_exact:backgroundInputOwnerUnchanged(),unique_index:unique,preimage_exact:literalNotesStateEqual(frame.state,expected),two_frames:twoFrames,window_bound:backgroundInputActionWindowBound(note,frame.window),process_verified:pidCode == .success && pid==appPID && apple(appPID),note_bound:text(note,kAXIdentifierAttribute)=="NotesField",owned_editor:ownEditor.map({CFEqual($0.0,root)})==true && ownNotesProbeExpected != nil,observation_complete:!nativeObservationIncomplete,focus_exact:notesProbeBoundInternalFocus(root,note,editableOnly:true) != nil,selection_exact:syntheticInputFullSelection(note,length),selected_text_writable:writable,not_attempted:report["background_input_selected_text_attempted"] as? Bool != true,deadline_valid:Date()<deadline,role:text(note,kAXRoleAttribute),phase:backgroundInputLeasePhase)
+  return scope.permitted && !nativeObservationIncomplete && backgroundInputOwnerUnchanged()
+ }
+ return observed==true
+}
+func backgroundSelectedTextNotesInput(_ expected:[String:Any],_ key:[String:String],_ after:String,syntheticOnly:Bool)throws->[String:Any] {
+ report["background_input_stage"]="preimage"
+ guard let original=backgroundInputOriginalPID,backgroundInputPhaseOwnerUnchanged() else{throw nativeFailure("background_input_background_required")}
+ let (root,n,before)=try readKey(key,leaveOpen:true,guardedExpected:expected)
+ ownNotesProbeExpected=expected;ownNotesProbeCleanupAttempted=false
+ try require((syntheticOnly ? backgroundInputAppendPermits(expected,after):ordinaryNotesAppendPermits(expected,after)) && literalNotesStateEqual(before,expected),"background_input_preimage_changed")
+ try require(backgroundInputPhasePermits(phase:backgroundInputLeasePhase,action:"capture",foregroundSame:NSWorkspace.shared.frontmostApplication?.processIdentifier==original,preimageExact:literalNotesStateEqual(before,expected),stateComplete:n.verifiedCanonicalState != nil,strictOwnerExact:false,savedList:false),"background_input_capture_phase_refused")
+ report["background_input_stage"]="owner";try beginBackgroundInputLease(original)
+ guard let inputOwnerKind=backgroundInputOwner?.kind else{throw nativeFailure("background_input_owner_unavailable")}
+ report["background_input_stage"]="preimage"
+ var intended=expected;intended["notes"]=after
+ let first=try backgroundInputFrame(root,key,expected,intended,n.fieldValues)
+ pause(0.04)
+ let second=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note)
+ try require(first.read.fieldValues==n.fieldValues && second.read.fieldValues==n.fieldValues,"background_input_preimage_changed")
+ if let backing=notesProbeTextBacking(second.note,expected["notes"] as! String) {report["notes_text_backing"]=backing}
+ report["background_input_stage"]="focus"
+ let focusWritable=try backgroundInputSettable(second.note,kAXFocusedAttribute)
+ try require(focusWritable,"background_input_focus_unsupported")
+ try require(backgroundInputPermission(second,root,expected,intended,phase:"focus",twoFrames:true,focusWritable:focusWritable),"background_input_focus_scope_unverified")
+ _=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note)
+ try require(backgroundInputOwnerUnchanged(),"background_input_owner_changed")
+ ownBackgroundInputAttempted=true;report["background_input_focus_attempted"]=true
+ let focusCode=AXUIElementSetAttributeValue(second.note,kAXFocusedAttribute as CFString,kCFBooleanTrue);report["background_input_focus_code"]=focusCode.rawValue
+ try require(focusCode == .success && backgroundInputOwnerUnchanged(),"background_input_focus_unverified")
+ let focusUntil=min(deadline,Date(timeIntervalSinceNow:3));var focusedFrames=0
+ while Date()<focusUntil,backgroundInputOwnerUnchanged() {
+  do {_=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note,focused:true);focusedFrames+=1;if focusedFrames==2 {break}} catch {focusedFrames=0}
+  pause(0.04)
+ }
+ report["background_input_focus_verified"]=focusedFrames==2
+ try require(focusedFrames==2,"background_input_receiver_unverified")
+ if let backing=notesProbeTextBacking(first.note,expected["notes"] as! String) {report["notes_text_backing"]=backing}
+ report["background_input_stage"]="selection"
+ let rangeWritable=try backgroundInputSettable(first.note,kAXSelectedTextRangeAttribute)
+ try require(rangeWritable,"background_input_range_unsupported")
+ let selectionBefore=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note,focused:true)
+ try require(backgroundInputPermission(selectionBefore,root,expected,intended,phase:"selection",twoFrames:focusedFrames==2,rangeWritable:rangeWritable),"background_input_range_scope_unverified")
+ _=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note,focused:true)
+ var requested=CFRange(location:0,length:(expected["notes"] as! String).utf16.count)
+ guard let range=AXValueCreate(.cfRange,&requested) else{throw nativeFailure("background_input_range_unavailable")}
+ try require(backgroundInputOwnerUnchanged(),"background_input_owner_changed")
+ report["background_input_range_attempted"]=true
+ let rangeCode=AXUIElementSetAttributeValue(first.note,kAXSelectedTextRangeAttribute as CFString,range);report["background_input_range_code"]=rangeCode.rawValue
+ try require(rangeCode == .success && backgroundInputOwnerUnchanged(),"background_input_range_unverified")
+ let selectedUntil=min(deadline,Date(timeIntervalSinceNow:3));var selectionFrames=0
+ while Date()<selectedUntil,backgroundInputOwnerUnchanged() {
+  do {
+   _=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note,focused:true)
+   if completeDiscovery({syntheticInputFullSelection(first.note,requested.length) && backgroundInputOwnerUnchanged()})==true {selectionFrames+=1;if selectionFrames==2 {break}} else{selectionFrames=0}
+  } catch {selectionFrames=0}
+  pause(0.04)
+ }
+ report["background_input_selection_verified"]=selectionFrames==2
+ try require(selectionFrames==2,"background_input_selection_unverified")
+ report["background_input_stage"]="text_input"
+ let selectedWritable=try backgroundInputSettable(first.note,kAXSelectedTextAttribute)
+ report["background_input_selected_text_settable"]=selectedWritable
+ try require(selectedWritable,"background_input_selected_text_unsupported")
+ // Both final pre-write frames must still be the complete original model and
+ // the exact full original UTF16 range in the same internally focused field.
+ let textBefore1=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note,focused:true)
+ try require(completeDiscovery({syntheticInputFullSelection(first.note,requested.length) && backgroundInputOwnerUnchanged()})==true,"background_input_selection_changed")
+ pause(0.04)
+ let textBefore2=try backgroundInputFrame(root,key,expected,intended,n.fieldValues,window:first.window,note:first.note,focused:true)
+ try require(textBefore1.read.fieldValues==textBefore2.read.fieldValues && textBefore2.read.fieldValues==n.fieldValues && backgroundInputSelectedTextPermission(textBefore2,root,expected,twoFrames:true,writable:selectedWritable,length:requested.length),"background_input_selected_text_scope_unverified")
+ try require(backgroundInputPhasePermits(phase:backgroundInputLeasePhase,action:"selected_text",foregroundSame:NSWorkspace.shared.frontmostApplication?.processIdentifier==original,preimageExact:true,stateComplete:true,strictOwnerExact:backgroundInputOwnerUnchanged(),savedList:false),"background_input_mutation_phase_refused")
+ try require(completeDiscovery({syntheticInputFullSelection(first.note,requested.length) && backgroundInputOwnerUnchanged()})==true,"background_input_selection_changed")
+ report["background_input_selected_text_attempted"]=true
+ let textCode=AXUIElementSetAttributeValue(first.note,kAXSelectedTextAttribute as CFString,after as CFString)
+ report["background_input_selected_text_code"]=textCode.rawValue;observeNativeError(textCode,required:true)
+ try require(textCode == .success && backgroundInputOwnerUnchanged(),"background_input_selected_text_unverified")
+ report["background_input_stage"]="postimage"
+ let postUntil=min(deadline,Date(timeIntervalSinceNow:3));var postFrames=0,post:BackgroundInputEditorFrame?
+ while Date()<postUntil,backgroundInputOwnerUnchanged() {
+  do {let observed=try backgroundInputFrame(root,key,intended,intended,n.fieldValues,window:first.window,note:first.note,focused:true);postFrames+=1;post=observed;if postFrames==2 {break}} catch {postFrames=0;post=nil}
+  pause(0.04)
+ }
+ report["background_input_postimage_verified"]=postFrames==2
+ guard postFrames==2,let post else{throw nativeFailure("background_input_postimage_unverified")}
+ ownEditor=(root,post.read);ownEditorFields=post.read.fieldValues;ownNotesProbeExpected=intended
+ report["background_input_stage"]="save"
+ let save=try backgroundInputAction(root,key,intended,post.read.fieldValues,first.window,names:["保存","Save","完成","Done"])
+ try require(backgroundInputOwnerUnchanged(),"background_input_owner_changed")
+ report["background_input_save_attempted"]=true
+ try require(press(save) && waitForList(root) && backgroundInputOwnerUnchanged(),"background_input_save_unverified")
+ try require(backgroundInputPhasePermits(phase:backgroundInputLeasePhase,action:"release",foregroundSame:NSWorkspace.shared.frontmostApplication?.processIdentifier==original,preimageExact:true,stateComplete:true,strictOwnerExact:backgroundInputOwnerUnchanged(),savedList:true),"background_input_release_phase_refused")
+ report["background_input_focus_scope_verified"]=true;backgroundInputOwner=nil;backgroundInputLeasePhase="readonly_postimage";backgroundOwnerPID=original
+ ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false
+ report["background_input_stage"]="persisted_read"
+ indexedLabels=nil;indexedCategory="";indexedQuery="";boundQuery=""
+ let (readRoot,reread,state)=try readKey(key,leaveOpen:true,guardedExpected:intended)
+ try require(literalNotesStateEqual(state,intended),"background_input_persistence_changed")
+ let p1=try backgroundInputFrame(readRoot,key,intended,intended,n.fieldValues,window:first.window)
+ pause(0.04)
+ let p2=try backgroundInputFrame(readRoot,key,intended,intended,n.fieldValues,window:first.window,note:p1.note)
+ try require(p1.read.fieldValues==reread.fieldValues && p2.read.fieldValues==reread.fieldValues && backgroundInputPhaseOwnerUnchanged(),"background_input_persistence_changed")
+ report["background_input_stage"]="final_cancel"
+ let finalCancel=try backgroundInputAction(readRoot,key,intended,p2.read.fieldValues,first.window,names:["取消","Cancel"])
+ try require(backgroundInputPhaseOwnerUnchanged(),"background_input_owner_changed")
+ try require(press(finalCancel) && waitForList(readRoot) && backgroundInputPhaseOwnerUnchanged(),"background_input_final_cancel_unverified")
+ ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false;ownBackgroundInputAttempted=false
+ report["background_input_persisted_verified"]=true;report["background_input_stage"]="complete"
+ var diagnostics:[String:Any]=[:];for name in backgroundInputDiagnosticKeys + ["notes_text_backing","notes_range_code","notes_range_settable"] {if let value=report[name]{diagnostics[name]=value}}
+ var result:[String:Any]=["ok":true,"background_only":true,"persisted":true,"credentials_changed":1,"app_activated":false,"imports":0,"exports":0,"state":state,"original_foreground_preserved":true,"input_keyboard_focus_preserved":true,"input_focus_owner_kind":inputOwnerKind,"keyboard_focus_scope":"focus_setter_through_save","diagnostics":diagnostics]
+ if syntheticOnly {result["synthetic_only"]=true}
+ return result
+}
+
 func deletedNote(_ key:[String:String],_ expected:[String:Any])throws->[String:Any] {
  // Recently Deleted is immutable until recovery. Verify the complete note in
  // its detail view, rather than trying to open a nonexistent edit form.
@@ -2895,7 +3582,7 @@ func execute(_ q:[String:Any])throws->[String:Any] {
    "passwords_frontmost":running.count==1 && NSWorkspace.shared.frontmostApplication?.processIdentifier==running[0].processIdentifier,
    "whole_vault_public_api":false,"native_protocol_delete_assumed":false]
  }
- try require(["read","deleted-read","deleted-location-read","notes-set","delete-redundant-note","recover-readonly-editor","notes-editor-probe","synthetic-foreground-notes-input"].contains(op),"operation_unsupported")
+ try require(["read","deleted-read","deleted-location-read","notes-set","delete-redundant-note","recover-readonly-editor","notes-editor-probe","synthetic-foreground-notes-input","synthetic-background-notes-input"].contains(op),"operation_unsupported")
  let recovery=q["expected"] as? [String:Any]
  var foregroundFocus=false
  guard let key=(q["key"] as? [String:String]) ?? (["recover-readonly-editor","notes-editor-probe"].contains(op) ? recovery?["key"] as? [String:String]:nil),Set(key.keys)==Set(["title","username"]),!(key["title"] ?? "").isEmpty else{throw nativeFailure("identity_invalid")}
@@ -2919,7 +3606,19 @@ func execute(_ q:[String:Any])throws->[String:Any] {
   foregroundFocus=true
   report["focus_requested"]=true;report["focus_settable"]=false;report["focus_verified"]=false
  }
- if appPID==0,!["notes-editor-probe","synthetic-foreground-notes-input"].contains(op) {
+ if op=="synthetic-background-notes-input" {
+  report["background_input_stage"]="input_validation";report["background_input_event_count"]=0
+  for name in ["background_input_selected_text_attempted","background_input_selected_text_settable","background_input_focus_attempted","background_input_focus_verified","background_input_range_attempted","background_input_selection_verified","background_input_save_attempted","background_input_postimage_verified","background_input_persisted_verified","background_input_editor_requires_review","background_input_owner_verified"] {report[name]=false}
+  try require(q["synthetic_only"] != nil && q["background_only"] != nil && q["foreground_focus"]==nil && notesProbeForegroundFocusOption(q["synthetic_only"])==true && notesProbeForegroundFocusOption(q["background_only"])==true,"background_input_explicit_flags_required")
+  guard let expected=recovery,let after=q["notes"] as? String,(expected["key"] as? [String:String])==key,backgroundInputAppendPermits(expected,after) else{throw nativeFailure("background_input_fixture_required")}
+ }
+ if op=="notes-set" {
+  report["background_input_stage"]="input_validation";report["background_input_event_count"]=0
+  for name in ["background_input_selected_text_attempted","background_input_selected_text_settable","background_input_focus_attempted","background_input_focus_verified","background_input_range_attempted","background_input_selection_verified","background_input_save_attempted","background_input_postimage_verified","background_input_persisted_verified","background_input_editor_requires_review","background_input_owner_verified"] {report[name]=false}
+  guard let expected=recovery,let after=q["notes"] as? String,(expected["key"] as? [String:String])==key,
+   ordinaryNotesAppendPermits(expected,after),q["foreground_focus"]==nil else{throw nativeFailure("note_preservation_refused")}
+ }
+ if appPID==0,!["notes-editor-probe","synthetic-foreground-notes-input","synthetic-background-notes-input","notes-set"].contains(op) {
   if NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords").isEmpty {_=try execute(["op":"connect"])}
  }
  let applications=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
@@ -2933,6 +3632,11 @@ func execute(_ q:[String:Any])throws->[String:Any] {
   try beginForegroundNotesProbeLease()
  }
  try acquireRequestLease()
+ if readonlyDetailNavigationOpPermits(op) {readonlyDetailNavigationAllowed=true}
+ if ["synthetic-background-notes-input","notes-set"].contains(op) {
+  guard let original=backgroundOwnerPID,original>0,original != appPID,NSWorkspace.shared.frontmostApplication?.processIdentifier==original else{throw nativeFailure("background_input_background_required")}
+  backgroundInputOriginalPID=original;backgroundInputLeasePhase="readonly_preimage"
+ }
  var windows:CFTypeRef?
  let windowsCode=AXUIElementCopyAttributeValue(AXUIElementCreateApplication(appPID),kAXWindowsAttribute as CFString,&windows)
  if op=="notes-editor-probe" {
@@ -2942,6 +3646,10 @@ func execute(_ q:[String:Any])throws->[String:Any] {
  if op=="synthetic-foreground-notes-input" {
   try require(windowsCode == .success && (windows as? [AXUIElement])?.isEmpty==false,"synthetic_input_window_unavailable")
   return try syntheticForegroundNotesInput(recovery!,key,q["notes"] as! String)
+ }
+ if ["synthetic-background-notes-input","notes-set"].contains(op) {
+  try require(windowsCode == .success && (windows as? [AXUIElement])?.isEmpty==false,"background_input_window_unavailable")
+  return try backgroundSelectedTextNotesInput(recovery!,key,q["notes"] as! String,syntheticOnly:op=="synthetic-background-notes-input")
  }
  if windowsCode == .success,let ws=windows as? [AXUIElement],ws.isEmpty {_=try execute(["op":"connect"])}
  if op=="recover-readonly-editor" {
@@ -2960,25 +3668,6 @@ func execute(_ q:[String:Any])throws->[String:Any] {
  guard let expected=q["expected"] as? [String:Any] else{throw nativeFailure("preimage_required")}
  let (root,n,before)=try readKey(key,leaveOpen:true)
  guard equalState(before,expected) else{_=cancel(root,n);throw nativeFailure("preimage_changed")}
- if op=="notes-set" {
-  guard let after=q["notes"] as? String,!after.isEmpty,after.utf16.count<=65536,!after.contains("\0"),after.contains(before["notes"] as? String ?? ""),n.shared=="unshared" else{_=cancel(root,n);throw nativeFailure("note_preservation_refused")}
-  // AXValue changed the visible editor without changing SwiftUI's saved model
-  // in the live synthetic test. Complete SelectedText replacement is the only
-  // supported write path; no field focus or injected input is used.
-  let note=try writableNotesField(root,n),old=before["notes"] as? String ?? "",ownerBefore=NSWorkspace.shared.frontmostApplication?.processIdentifier,keyboardBefore=focusPID()
-  var full=CFRange(location:0,length:old.utf16.count)
-  guard let selection=AXValueCreate(.cfRange,&full),set(note,kAXSelectedTextRangeAttribute,selection),let seen=attr(note,kAXSelectedTextRangeAttribute),CFGetTypeID(seen)==AXValueGetTypeID() else{throw nativeFailure("note_selection_unverified")}
-  var actual=CFRange();try require(AXValueGetValue(unsafeBitCast(seen,to:AXValue.self),.cfRange,&actual) && actual.location==0 && actual.length==full.length,"note_selection_unverified")
-  try require(set(note,kAXSelectedTextAttribute,after as CFString),"note_text_replacement_refused")
-  try require(NSWorkspace.shared.frontmostApplication?.processIdentifier==ownerBefore && focusPID()==keyboardBefore && front(),"note_owner_changed")
-  let current=fields(nodes(root));var wanted=n.fieldValues;wanted["NotesField"]=after
-  if current.filter({$0.key != "NotesField"})==n.fieldValues.filter({$0.key != "NotesField"}),current["NotesField"] != nil {ownEditorFields=current}
-  guard current==wanted,!nativeObservationIncomplete,let save=button(nodes(root),["保存","Save","完成","Done"]),boundedClick(save,root) else{throw nativeFailure("note_save_unverified")}
-  try require(waitForList(root),"note_save_unverified")
-  ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false
-  // Readback is performed independently by the CLI before it journals done.
-  return ["ok":true]
- }
  let candidateOnly=(before["password"] as? String)=="" && key["username"]=="" && n.sites.isEmpty && n.sitesKnown &&
   n.otpAbsent && n.passkeyAbsent && n.shared=="unshared" && (before["extra_fields"] as? [[String:String]])?.isEmpty==true
  guard candidateOnly,fields(nodes(root))==n.fieldValues else{_=cancel(root,n);throw nativeFailure("redundant_note_proof_refused")}
@@ -3009,10 +3698,12 @@ func execute(_ q:[String:Any])throws->[String:Any] {
 // A single process owns one list index for the complete bounded CLI batch.
 guard args==["--serve"] else {fputs("maintenance_invalid_entry_point\n",stderr);exit(2)}
 while let line=readLine(strippingNewline:true) {
+ readonlyDetailNavigationAllowed=false
+ backgroundInputStrictOwnerLatch=BackgroundStrictOwnerLatch()
  deadline=Date(timeIntervalSinceNow:90);nativeObservationIncomplete=false
- foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil
- for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {report[key]=nil}
- for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys + deleteDialogDiagnosticKeys {report[key]=nil}
+ foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil;backgroundInputOwner=nil;backgroundInputOriginalPID=nil;backgroundInputLeasePhase="readonly_preimage"
+ for key in ["search_clear_initial_stage","search_clear_initial_context_seen","search_clear_initial_owner_same","search_clear_initial_keyboard_same","search_clear_initial_query_read","search_clear_initial_rows_read","search_clear_initial_category_matches","search_clear_initial_frame_complete","search_clear_initial_raw_count","search_clear_initial_observations","confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_text_backing","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {report[key]=nil}
+ for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys + deleteDialogDiagnosticKeys + backgroundInputDiagnosticKeys {report[key]=nil}
  var response:[String:Any]=["ok":false,"app_activated":false,"backend":"apple-passwords-accessibility"]
  do {
   guard line.utf8.count<=4*1024*1024,let bytes=line.data(using:.utf8),let q=try JSONSerialization.jsonObject(with:bytes) as? [String:Any],let id=q["id"] as? Int else{throw nativeFailure("request_invalid")}
@@ -3024,13 +3715,13 @@ while let line=readLine(strippingNewline:true) {
   response["error"]=message.hasPrefix("maintenance_") && message.dropFirst(12).allSatisfy({$0.isLowercase || $0=="_"}) ? message:"maintenance_native_operation_failed"
   // Return only structural reasons. Never expose field values in diagnostics.
   var diagnostics:[String:Any]=[:]
-  for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {
+  for key in ["search_clear_initial_stage","search_clear_initial_context_seen","search_clear_initial_owner_same","search_clear_initial_keyboard_same","search_clear_initial_query_read","search_clear_initial_rows_read","search_clear_initial_category_matches","search_clear_initial_frame_complete","search_clear_initial_raw_count","search_clear_initial_observations","confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_text_backing","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {
    if let value=report[key] {diagnostics[key]=value}
   }
-  for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys + deleteDialogDiagnosticKeys {if let value=report[key] {diagnostics[key]=value}}
+  for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys + deleteDialogDiagnosticKeys + backgroundInputDiagnosticKeys {if let value=report[key] {diagnostics[key]=value}}
   response["diagnostics"]=diagnostics
  }
- foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil
+ foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil;backgroundInputOwner=nil;backgroundInputOriginalPID=nil;backgroundInputLeasePhase="readonly_preimage"
  if let bytes=try? JSONSerialization.data(withJSONObject:response,options:[.sortedKeys]),let text=String(data:bytes,encoding:.utf8) {print(text);fflush(stdout)}
 }
 closeOwnEditor()

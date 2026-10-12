@@ -8,7 +8,7 @@ import type { PasswordEntry, Payload } from "./types.ts";
 import { ensureStarted } from "./startup.ts";
 import { exchangeStatus, launchExchangeDemo, launchOTPLoginDemo, prepareExchangeComponent } from "./exchange.ts";
 import { launchNotesImport, prepareNotes } from "./notes.ts";
-import { readItem, inspectItems, runBatch, maintenanceDoctor, maintenanceConnect, recoverEditor, probeNotesEditor, syntheticForegroundNotesInput } from "./maintenance.ts";
+import { readItem, inspectItems, runBatch, maintenanceDoctor, maintenanceConnect, recoverEditor, probeNotesEditor, syntheticForegroundNotesInput, syntheticBackgroundNotesInput } from "./maintenance.ts";
 import { capabilities } from "./capabilities.ts";
 
 const client = new ApplePasswordManager();
@@ -176,6 +176,15 @@ const batch = new Command().description("Recoverable, resumable maintenance batc
     .option("--save-partial", "On the first error, save only completed verified snapshots and stop with a nonzero exit; never continue or retry.")
     .action(async (o:{targets:string;output:string;savePartial?:boolean}) => await inspectItems(o.targets,o.output,o.savePartial === true)));
 const item = new Command().description("Exact native item/notes maintenance; never activates an app.")
+  .command("test-notes-background-input", new Command().description("One journaled background notes-input trial on two exact existing synthetic fixtures; preserves the current foreground and focused element.")
+    .option("--snapshot <path:string>", "Private hash-verified original synthetic snapshot.", {required:true})
+    .option("--notes-file <path:string>", "Private UTF-8 notes preserving the complete original body.", {required:true})
+    .option("--journal <path:string>", "New private one-shot journal; existing journals are never retried.", {required:true})
+    .option("--background-synthetic", "Explicitly allow this bounded background synthetic trial; never activates an app.")
+    .action(async (o:{snapshot:string;notesFile:string;journal:string;backgroundSynthetic?:boolean}) => {
+      if (o.backgroundSynthetic !== true) throw new APWError(Status.INVALID_PARAM,"maintenance_synthetic_background_required");
+      await syntheticBackgroundNotesInput(o.snapshot,o.notesFile,o.journal);
+    }))
   .command("test-notes-input", new Command().description("One journaled notes-input trial on two exact pre-existing synthetic fixtures; Passwords must already be foreground.")
     .option("--snapshot <path:string>", "Private hash-verified original synthetic snapshot.", {required:true})
     .option("--notes-file <path:string>", "Private UTF-8 notes preserving the complete original body.", {required:true})

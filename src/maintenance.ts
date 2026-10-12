@@ -50,6 +50,14 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
       "first_cancel", "preservation_cohort", "preservation_read", "preservation_state", "final_cancel", "complete", "foreground_owner", "notes_focus"],
     synthetic_input_stage: ["input_validation", "foreground_owner", "exact_read", "preimage", "notes_focus", "permission", "selection",
       "text_input", "postimage", "save", "persisted_read", "final_cancel", "complete"],
+    background_input_stage: ["input_validation","owner","preimage","focus","selection","text_input","postimage","save","persisted_read","final_cancel","complete"],
+    background_input_post_gate: ["initial","scope","before_event"],
+    background_input_permission_phase: ["focus","selection","unicode"],
+    background_input_owner_kind: ["present","absent"],
+    background_input_capture_failure: ["none","foreground_unavailable","passwords_foreground","foreground_changed","wrong_phase","lease_already_present","input_already_attempted"],
+    background_input_owner_failure: ["none","no_lease","deadline","foreground_unavailable","passwords_foreground",
+      "foreground_changed","focused_copy_failed","focused_type_invalid","focused_pid_failed","focused_pid_changed",
+      "focused_role_failed","focused_role_changed","focused_element_changed","observation_incomplete"],
   };
   for (const [name, allowed] of Object.entries(strings)) if (typeof raw[name] === "string" && allowed.includes(raw[name] as string)) out[name] = raw[name];
   for (const name of ["ui_set_error_code", "ui_press_error_code", "all_list_bridge_stage", "all_list_bridge_error_code", "all_list_bridge_exit_code",
@@ -83,6 +91,29 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
   }
   const inputEvents=raw.synthetic_input_event_count;
   if (typeof inputEvents === "number" && Number.isInteger(inputEvents) && inputEvents>=0 && inputEvents<=4) out.synthetic_input_event_count=inputEvents;
+  for (const name of ["background_input_focus_attempted","background_input_range_attempted","background_input_save_attempted",
+    "background_input_persisted_verified","background_input_editor_requires_review","background_input_focus_verified",
+    "background_input_selection_verified","background_input_postimage_verified","background_input_owner_verified",
+    "background_input_owner_foreground_same","background_input_owner_pid_same","background_input_owner_role_same",
+    "background_input_owner_element_same","background_input_owner_frame_complete","background_input_post_access",
+    "background_input_modifiers_clear","background_input_permission_verified","background_input_focus_scope_verified",
+    "background_input_selected_text_attempted","background_input_selected_text_settable"]) {
+    if (typeof raw[name]==="boolean") out[name]=raw[name];
+  }
+  for (const name of ["background_input_focus_code","background_input_range_code","background_input_owner_copy_code",
+    "background_input_owner_pid_code","background_input_owner_role_code","background_input_selected_text_code"]) {
+    const v=raw[name];if (typeof v==="number" && Number.isInteger(v) && Math.abs(v)<=100000000) out[name]=v;
+  }
+  const backgroundEvents=raw.background_input_event_count;
+  for (const [name, keys] of Object.entries({
+    background_input_modifier_flags:["shift","control","alternate","command","caps","help","secondary_fn","numeric_pad","noncoalesced","unknown"],
+    background_input_permission_scope:["background","owner_exact","unique_index","preimage_exact","two_frames","window_bound","process_verified","note_bound","owned_editor","observation_complete","focus_writable","focus_exact","range_writable","selection_exact","post_access","modifiers_clear","not_attempted","deadline_valid"],
+  })) {
+    const v=raw[name];
+    if (v && typeof v==="object" && !Array.isArray(v) && Object.keys(v).length<=keys.length &&
+      Object.entries(v).every(([k,val])=>keys.includes(k) && typeof val==="boolean")) out[name]=v;
+  }
+  if (typeof backgroundEvents==="number" && Number.isInteger(backgroundEvents) && backgroundEvents>=0 && backgroundEvents<=2) out.background_input_event_count=backgroundEvents;
   for (const [name,max] of [["confirmation_bridge_exit_code",255],["confirmation_editor_path_depth",16]] as const) {
     const v=raw[name]; if (typeof v === "number" && Number.isInteger(v) && v>=0 && v<=max) out[name]=v;
   }
@@ -113,6 +144,19 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
       typeof focus.code === "number" && Number.isInteger(focus.code) && Math.abs(focus.code) <= 100000000 &&
       typeof focus.same_pid === "boolean" && typeof focus.matches_notes === "boolean" &&
       typeof focus.known_role === "string" && [...roles,"none"].includes(focus.known_role)) out.notes_internal_focus = focus;
+  const backing=raw.notes_text_backing as Record<string,unknown> | undefined;
+  const backingCodes=["number_code","string_code","focus_code","focus_settable_code","shared_text_code","shared_focus_code","parameterized_code"];
+  const backingBools=["count_known","count_matches","string_known","string_matches","focus_known","focus_value","focus_settable"];
+  const backingCounts=["shared_text_count","shared_focus_count"];
+  const backingParameters=["AXStringForRange","AXAttributedStringForRange","AXBoundsForRange","AXLineForIndex","AXRangeForLine",
+    "AXRangeForIndex","AXRTFForRange","AXStyleRangeForIndex","AXTextOperation"];
+  if (backing && typeof backing==="object" && !Array.isArray(backing) &&
+      Object.keys(backing).sort().join()===[...backingCodes,...backingBools,...backingCounts,"parameterized"].sort().join() &&
+      backingCodes.every(k=>typeof backing[k]==="number" && Number.isInteger(backing[k]) && Math.abs(backing[k] as number)<=100000000) &&
+      backingBools.every(k=>typeof backing[k]==="boolean") &&
+      backingCounts.every(k=>typeof backing[k]==="number" && Number.isInteger(backing[k]) && (backing[k] as number)>=-1 && (backing[k] as number)<=16) &&
+      Array.isArray(backing.parameterized) && backing.parameterized.length<=backingParameters.length &&
+      backing.parameterized.every(x=>typeof x==="string" && backingParameters.includes(x))) out.notes_text_backing=backing;
   if (typeof raw.all_list_bridge_timed_out === "boolean") out.all_list_bridge_timed_out = raw.all_list_bridge_timed_out;
   for (const name of ["search_clear_before_count", "search_clear_after_count", "search_result_count"]) {
     const v=raw[name]; if (typeof v === "number" && Number.isInteger(v) && v>=0 && v<=3000) out[name]=v;
@@ -381,11 +425,17 @@ export async function probeNotesEditor(snapshotPath: string, foregroundFocus = f
   } finally {await native.close();}
 }
 export async function syntheticForegroundNotesInput(snapshotPath: string, notesFilePath: string, journalPath: string): Promise<void> {
+  return syntheticNotesInput(snapshotPath,notesFilePath,journalPath,false);
+}
+export async function syntheticBackgroundNotesInput(snapshotPath: string, notesFilePath: string, journalPath: string): Promise<void> {
+  return syntheticNotesInput(snapshotPath,notesFilePath,journalPath,true);
+}
+async function syntheticNotesInput(snapshotPath: string, notesFilePath: string, journalPath: string, background: boolean): Promise<void> {
   let expected: State, notes: string, beforeHash: string;
   try {
     snapshotPath = await absolute(snapshotPath); notesFilePath = await absolute(notesFilePath);
     await privateParent(snapshotPath); await privateParent(notesFilePath);
-    const raw = JSON.parse(new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(snapshotPath)));
+    const raw = JSON.parse(new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(snapshotPath,background)));
     if (!raw || raw.format !== "apw-item-snapshot-v1" || !raw.state || !key(raw.state.key)) fail("synthetic_notes_input_invalid");
     expected = state(raw.state, raw.state.key);
     if (Object.keys(expected).sort().join() !== "extra_fields,key,native_title,notes,otp,passkey,password,sharing,sites" ||
@@ -401,12 +451,13 @@ export async function syntheticForegroundNotesInput(snapshotPath: string, notesF
     if (raw.sha256 !== beforeHash || !existingTitles.includes(expected.key.title) || expected.native_title !== expected.key.title ||
         !expected.notes.includes("APW_EXCHANGE_SYNTHETIC_V1") || expected.password !== "" ||
         (expected.key.username !== "" && !expected.key.username.endsWith(".invalid")) || !expected.sites.every(syntheticSite) ||
-        expected.sharing !== "unshared" || expected.extra_fields.length !== 0) fail("synthetic_notes_input_invalid");
-    notes = new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(notesFilePath));
+        expected.sharing !== "unshared" || expected.extra_fields.length !== 0 ||
+        (background && (expected.otp === "present" || expected.passkey === "present"))) fail("synthetic_notes_input_invalid");
+    notes = new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(notesFilePath,background));
     const suffix = notes.slice(expected.notes.length);
     // JS string length/slice use the exact UTF-16 units bound by the native API.
     if (!notes.startsWith(expected.notes) || !suffix || suffix.length > 512 ||
-        !suffix.includes("APW_FOREGROUND_INPUT_SYNTHETIC_V1") || notes.length > 4096 || notes.includes("\0")) fail("synthetic_notes_input_invalid");
+        !suffix.includes(background ? "APW_BACKGROUND_INPUT_SYNTHETIC_V2":"APW_FOREGROUND_INPUT_SYNTHETIC_V1") || notes.length > 4096 || notes.includes("\0")) fail("synthetic_notes_input_invalid");
   } catch {fail("synthetic_notes_input_invalid");}
   const intended: State = {...expected!, notes:notes!}, afterHash = await hash(intended);
   journalPath = await absolute(journalPath); await privateParent(journalPath);
@@ -420,21 +471,26 @@ export async function syntheticForegroundNotesInput(snapshotPath: string, notesF
   try {
     const reserved = await file!.stat(); await verifySnapshotOutput(file!,journalPath,reserved);
     const append = async (event: "intent" | "done" | "uncertain") => {
-      await writeSnapshot(file!,journalPath,reserved,encoder.encode(JSON.stringify({format:"apw-synthetic-notes-input-v1",event,
-        synthetic_only:true,before_sha256:beforeHash!,after_sha256:afterHash,at:new Date().toISOString()}) + "\n"));
+      await writeSnapshot(file!,journalPath,reserved,encoder.encode(JSON.stringify({format:background ? "apw-synthetic-background-notes-input-v2":"apw-synthetic-notes-input-v1",event,
+        synthetic_only:true,...(background ? {background_only:true}:{}),before_sha256:beforeHash!,after_sha256:afterHash,at:new Date().toISOString()}) + "\n"));
     };
     await append("intent"); // private, fsynced intent always precedes the one call
     try {
       native = new Native();
-      const result = await native.call("synthetic-foreground-notes-input",{expected:expected!,key:expected!.key,notes:notes!,
-        synthetic_only:true,foreground_focus:true});
+      const result = await native.call(background ? "synthetic-background-notes-input":"synthetic-foreground-notes-input",{expected:expected!,key:expected!.key,notes:notes!,
+        synthetic_only:true,...(background ? {background_only:true}:{foreground_focus:true})});
       if (result.synthetic_only !== true || result.persisted !== true || result.credentials_changed !== 1 ||
           result.exports !== 0 || result.imports !== 0 || result.app_activated !== false) fail("synthetic_notes_input_unverified");
+      if (background && ([result.background_only,result.original_foreground_preserved,result.input_keyboard_focus_preserved].some(x=>x!==true) ||
+          result.keyboard_focus_scope!=="focus_setter_through_save" ||
+          !["present","absent"].includes(result.input_focus_owner_kind as string))) fail("synthetic_notes_input_unverified");
       let after: State;
       try {after = state(result.state,expected!.key);} catch {fail("synthetic_notes_input_unverified");}
       if (canonical(after!) !== canonical(intended) || await hash(after!) !== afterHash) fail("synthetic_notes_input_unverified");
       await append("done");
       console.log(JSON.stringify({synthetic_only:true,persisted:true,credentials_changed:1,exports:0,imports:0,app_activated:false,
+        ...(background ? {background_only:true,original_foreground_preserved:true,input_keyboard_focus_preserved:true,
+          keyboard_focus_scope:"focus_setter_through_save",input_focus_owner_kind:result.input_focus_owner_kind}:{}),
         before_sha256:beforeHash!,after_sha256:afterHash}));
     } catch (e) {await append("uncertain");throw e;}
   } finally {await native?.close();file!.close();}
@@ -456,16 +512,7 @@ async function verifyRedundantDeletion(native: Native, o: Operation, before: Sta
   if (await hash(before) !== o.before_sha256 || before.password !== "" || before.key.username !== "" || before.sites.length ||
       before.otp !== "absent" || before.passkey !== "absent" || before.sharing !== "unshared" || before.extra_fields.length ||
       !before.notes || before.notes !== o.preserve_text || o.source_ids!.some(id => !before.notes.includes(id))) fail("redundant_note_proof_refused");
-  try {
-    if (await hash(await native.read(o.target, true, before)) !== o.before_sha256) fail("deletion_unverified");
-  } catch (e) {
-    // A timeout/invalid/ambiguous/refused reply must never become evidence that
-    // Apple merely hides the body. Only this precise successful-frame failure
-    // may request the separate, location-only native observation.
-    if (!(e instanceof APWError) || e.message !== "maintenance_deleted_body_unverified") throw e;
-    // An unsupported preflight on a new delete preserves legacy full-body
-    // compatibility, but never permits the weaker historical identity scope.
-    if (preflightAbsent === false) fail("outcome_requires_review");
+  const verifyLocationPreservation = async (): Promise<DeletionProof> => {
     const result = await native.call("deleted-location-read", {key:o.target, expected:before});
     const location = result.location as Record<string,unknown> | undefined;
     if (result.verification !== "deleted_note_location_only" || result.body_verified !== false || Object.hasOwn(result,"state") ||
@@ -481,6 +528,19 @@ async function verifyRedundantDeletion(native: Native, o: Operation, before: Sta
     if (canonical(first) !== canonical(second)) fail("keeper_proof_refused");
     return {deletion_verification:preflightAbsent === true ? "content_preservation_deleted_location" : "legacy_pending_content_preservation_deleted_location",
       content_preservation_verified:true, deleted_body_verified:false};
+  };
+  // A verified preflight and private complete preimage already bind a new
+  // deletion to this exact note. Request the full conservation proof directly;
+  // the Deleted detail's hidden body adds no evidence to this proof mode.
+  if (preflightAbsent === true) return await verifyLocationPreservation();
+  try {
+    if (await hash(await native.read(o.target, true, before)) !== o.before_sha256) fail("deletion_unverified");
+  } catch (e) {
+    // Historical/unsupported-preflight records retain the precise body gate.
+    // Never reinterpret a timeout/invalid/ambiguous/refused result as hidden text.
+    if (!(e instanceof APWError) || e.message !== "maintenance_deleted_body_unverified") throw e;
+    if (preflightAbsent === false) fail("outcome_requires_review");
+    return await verifyLocationPreservation();
   }
   await exactActiveAbsence(native, o.target);
   await completePreservedKeeper(native, o, before);
@@ -623,7 +683,7 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
       if (await hash(before) !== o.before_sha256) fail("preimage_changed");
       let intended: State | undefined, deletedPreflightAbsent: boolean | undefined;
       if (o.kind === "notes-set") {
-        if (before.sharing !== "unshared" || !o.notes!.includes(before.notes)) fail("note_preservation_refused");
+        if (before.sharing !== "unshared" || !o.notes!.startsWith(before.notes) || o.notes===before.notes || o.notes!.length>4096) fail("note_preservation_refused");
         intended = { ...before, notes: o.notes! };
       } else {
         if (before.password !== "" || before.key.username !== "" || before.sites.length || before.otp !== "absent" ||
@@ -666,6 +726,13 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
         mutations++;
         let deletionProof:DeletionProof | undefined;
         if (intended) {
+          if ([result.persisted,result.background_only,result.original_foreground_preserved,result.input_keyboard_focus_preserved].some(x=>x!==true) ||
+              result.app_activated!==false || result.credentials_changed!==1 || result.exports!==0 || result.imports!==0 ||
+              !["present","absent"].includes(result.input_focus_owner_kind as string) ||
+              result.keyboard_focus_scope!=="focus_setter_through_save") fail("notes_persistence_unverified");
+          let acknowledged: State;
+          try {acknowledged=state(result.state,o.target);} catch {fail("notes_persistence_unverified");}
+          if (canonical(acknowledged!)!==canonical(intended) || await hash(acknowledged!)!==afterHash) fail("notes_persistence_unverified");
           if (await hash(await native.read(o.target)) !== afterHash) fail("readback_changed");
         } else {
           if (result.recoverable !== true) fail("deletion_unverified");

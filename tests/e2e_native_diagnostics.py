@@ -6,6 +6,17 @@ only; frames accepts only an integer 0..3000. True/False and frame boundaries
 must survive, while strings, containers, null, integer-as-bool, bool-as-count,
 fractional/out-of-range counts and arbitrary unknown secret data must be dropped.
 The diagnostic cannot turn a refused native operation into successful readback.
+
+Background-input proof diagnostics failure specification: the exact four keys
+focus_verified, selection_verified, postimage_verified, owner_verified accept
+both boolean values only. Strings, numbers, null and containers must be dropped;
+their presence never converts a failing native read into a completed snapshot.
+
+Owner-diagnostic failure specification: only the fourteen fixed owner failure
+reasons below survive; copy/pid/role error codes are strict integers bounded by
+100,000,000 in either direction, and the five owner comparisons are strict
+booleans. Unknown/free-form reasons, strings, numeric booleans, fractional/
+out-of-range codes and containers must be dropped without reporting success.
 """
 import argparse
 import json
@@ -42,6 +53,15 @@ SAFE = {
     "notes_probe_row_count": 1,
     "notes_children": {"count":1,"complete":True,"nodes":[{"role":"AXTextField","depth":1,"identifier_present":False,"same_pid":True,"parent_bound":True,"editable_role":True}]},
     "notes_internal_focus": {"code":0,"same_pid":True,"matches_notes":False,"known_role":"AXTextField"},
+    "notes_text_backing": {
+        "number_code":0,"count_known":True,"count_matches":True,
+        "string_code":0,"string_known":True,"string_matches":True,
+        "focus_code":0,"focus_known":True,"focus_value":False,
+        "focus_settable_code":0,"focus_settable":True,
+        "shared_text_code":-25205,"shared_text_count":-1,
+        "shared_focus_code":0,"shared_focus_count":0,
+        "parameterized_code":0,"parameterized":["AXStringForRange","AXAttributedStringForRange"],
+    },
     "notes_probe_read_opened": True,
     "notes_probe_recovery_attempted": False,
     "notes_probe_editor_recovered": False,
@@ -79,8 +99,37 @@ SAFE = {
     "delete_dialog_recoverable": True,
     "delete_dialog_binding_verified": False,
     "delete_dialog_frames_observed": 2,
+    "background_input_focus_verified": True,
+    "background_input_selection_verified": False,
+    "background_input_postimage_verified": True,
+    "background_input_owner_verified": False,
+    "background_input_post_gate": "initial",
+    "background_input_permission_phase": "unicode",
+    "background_input_post_access": True,
+    "background_input_modifiers_clear": False,
+    "background_input_permission_verified": False,
+    "background_input_focus_scope_verified": True,
+    "background_input_selected_text_attempted": True,
+    "background_input_selected_text_settable": False,
+    "background_input_selected_text_code": -25205,
+    "background_input_modifier_flags": {"shift":False,"command":True,"unknown":False},
+    "background_input_permission_scope": {"owner_exact":True,"selection_exact":False,"modifiers_clear":True},
+    "background_input_owner_failure": "focused_element_changed",
+    "background_input_owner_copy_code": 0,
+    "background_input_owner_pid_code": -25204,
+    "background_input_owner_role_code": 0,
+    "background_input_owner_foreground_same": True,
+    "background_input_owner_pid_same": False,
+    "background_input_owner_role_same": True,
+    "background_input_owner_element_same": False,
+    "background_input_owner_frame_complete": True,
 }
 SECRET = "APW_SYNTHETIC_DIAGNOSTIC_SECRET_20261012"
+OWNER_REASONS = ("none", "no_lease", "deadline", "foreground_unavailable",
+    "passwords_foreground", "foreground_changed", "focused_copy_failed",
+    "focused_type_invalid", "focused_pid_failed", "focused_pid_changed",
+    "focused_role_failed", "focused_role_changed", "focused_element_changed",
+    "observation_incomplete")
 
 
 def main():
@@ -193,6 +242,7 @@ def main():
                 "notes_probe_row_count": 101,
                 "notes_children": {"count":1,"complete":True,"nodes":[{"role":SECRET,"depth":1,"identifier_present":True,"same_pid":True,"parent_bound":True,"editable_role":True}]},
                 "notes_internal_focus": {"code":0,"same_pid":True,"matches_notes":True,"known_role":SECRET},
+                "notes_text_backing": {**SAFE["notes_text_backing"],"text":SECRET},
                 "notes_probe_read_opened": SECRET,
                 "notes_probe_recovery_attempted": 1,
                 "notes_probe_editor_recovered": {"notes":SECRET},
@@ -225,11 +275,46 @@ def main():
                 "delete_dialog_recoverable": None,
                 "delete_dialog_binding_verified": [],
                 "delete_dialog_frames_observed": 3001,
+                "background_input_focus_verified": SECRET,
+                "background_input_selection_verified": 1,
+                "background_input_postimage_verified": {"notes": SECRET},
+                "background_input_owner_verified": None,
+                "background_input_owner_failure": SECRET,
+                "background_input_owner_copy_code": True,
+                "background_input_owner_pid_code": 100000001,
+                "background_input_owner_role_code": {"notes": SECRET},
+                "background_input_owner_foreground_same": "true",
+                "background_input_owner_pid_same": 1,
+                "background_input_owner_role_same": SECRET,
+                "background_input_owner_element_same": [],
+                "background_input_owner_frame_complete": None,
+                "background_input_post_gate": SECRET,
+                "background_input_permission_phase": SECRET,
+                "background_input_post_access": 1,
+                "background_input_modifiers_clear": "true",
+                "background_input_permission_verified": None,
+                "background_input_focus_scope_verified": [],
+                "background_input_selected_text_attempted": 1,
+                "background_input_selected_text_settable": "true",
+                "background_input_selected_text_code": True,
+                "background_input_modifier_flags": {"shift":False,"secret":SECRET},
+                "background_input_permission_scope": {"owner_exact":True,"selection_exact":SECRET},
             }
             reply = run("malformed-allowed-keys", malformed)
             check("allowed diagnostic keys reject free text, containers and wrong scalar types", reply.get("diagnostics", {}) == {})
             reply = run("unavailable-status", {"status": "unavailable", "notes": SECRET})
             check("known unavailable context classification survives without free text", reply.get("diagnostics") == {"status": "unavailable"})
+
+            backing=SAFE["notes_text_backing"]
+            for index, patch in enumerate((
+                {"count_known":1}, {"string_matches":"true"}, {"focus_value":None},
+                {"number_code":True}, {"focus_code":100000001},
+                {"shared_text_count":17}, {"shared_focus_count":-2},
+                {"shared_text_count":False}, {"parameterized":[SECRET]},
+                {"parameterized":["AXStringForRange"]*17},
+            )):
+                reply=run("text-backing-malformed-"+str(index),{"notes_text_backing":{**backing,**patch}})
+                check("malformed backing observation is entirely dropped "+str(index),reply.get("diagnostics",{})=={})
 
             for index, value in enumerate((0, 3000)):
                 reply = run("delete-dialog-count-boundary-" + str(index), {"delete_dialog_frames_observed": value, "unknown": SECRET})
@@ -240,6 +325,43 @@ def main():
             bool_keys = [key for key in SAFE if key.startswith("delete_dialog_") and key != "delete_dialog_frames_observed"]
             reply = run("delete-dialog-reversed-booleans", {key:not SAFE[key] for key in bool_keys})
             check("delete-dialog both exact bool values survive", reply.get("diagnostics") == {key:not SAFE[key] for key in bool_keys})
+
+            background_keys = [key for key in SAFE if key.startswith("background_input_") and type(SAFE[key]) is bool]
+            reply = run("background-input-reversed-booleans", {key:not SAFE[key] for key in background_keys})
+            check("background-input all four exact bool values survive", reply.get("diagnostics") == {key:not SAFE[key] for key in background_keys})
+            for index, bad_value in enumerate((SECRET, 1, "true", {}, [], None)):
+                reply = run("background-input-malicious-" + str(index), {key:bad_value for key in background_keys})
+                check("background-input all four reject malformed value " + str(index), reply.get("diagnostics", {}) == {})
+
+            for value in ("present", "absent"):
+                reply = run("owner-kind-" + value, {"background_input_owner_kind": value})
+                check("owner kind " + value + " survives", reply.get("diagnostics") == {"background_input_owner_kind": value})
+            for index, value in enumerate((SECRET, "unknown", 1, True, None, {}, [])):
+                reply = run("owner-kind-bad-" + str(index), {"background_input_owner_kind": value})
+                check("invalid owner kind dropped " + str(index), reply.get("diagnostics", {}) == {})
+
+            # Capture failure enum must expose no app identities or arbitrary text.
+            capture_reasons = ("none", "foreground_unavailable", "passwords_foreground", "foreground_changed", "wrong_phase", "lease_already_present", "input_already_attempted")
+            for index, reason in enumerate(capture_reasons):
+                reply = run("background-capture-reason-" + str(index), {"background_input_capture_failure": reason, "unknown": SECRET})
+                check("background capture fixed reason survives " + str(index), reply.get("diagnostics") == {"background_input_capture_failure": reason})
+            for index, bad_reason in enumerate((SECRET, "foreground_changed:" + SECRET, 1, {}, [], None)):
+                reply = run("background-capture-reason-malicious-" + str(index), {"background_input_capture_failure": bad_reason})
+                check("background capture unknown reason dropped " + str(index), reply.get("diagnostics", {}) == {})
+
+            for index, reason in enumerate(OWNER_REASONS):
+                reply = run("background-owner-reason-" + str(index), {"background_input_owner_failure": reason, "unknown": SECRET})
+                check("background owner fixed reason survives " + str(index), reply.get("diagnostics") == {"background_input_owner_failure": reason})
+            for index, bad_reason in enumerate((SECRET, "focused_role_failed:" + SECRET, 1, {}, [], None)):
+                reply = run("background-owner-reason-malicious-" + str(index), {"background_input_owner_failure": bad_reason})
+                check("background owner unknown reason dropped " + str(index), reply.get("diagnostics", {}) == {})
+            owner_codes = ("background_input_owner_copy_code", "background_input_owner_pid_code", "background_input_owner_role_code")
+            for index, code in enumerate((-100000000, 0, 100000000)):
+                reply = run("background-owner-code-boundary-" + str(index), {key:code for key in owner_codes})
+                check("background owner three exact code bounds survive " + str(index), reply.get("diagnostics") == {key:code for key in owner_codes})
+            for index, bad_code in enumerate((-100000001, 100000001, True, False, 0.5, SECRET, {}, [], None)):
+                reply = run("background-owner-code-malicious-" + str(index), {key:bad_code for key in owner_codes})
+                check("background owner three malformed codes dropped " + str(index), reply.get("diagnostics", {}) == {})
 
             recovery_variants = [("search_clear_method", value) for value in ["addressed_semantic_clear", "addressed_value_then_semantic_clear", "addressed_value_cycle"]] + [("search_clear_failure", value) for value in ["clear_binding_unverified", "clear_value_submission_failed"]]
             for field, value in recovery_variants:

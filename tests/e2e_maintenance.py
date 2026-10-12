@@ -50,7 +50,10 @@ for line in sys.stdin:
         s['writes']+=1
         if s['mode']!='write_ignored': found[0]['notes']=q['notes']
         if s['mode']=='changed_password': found[0]['password']='CHANGED'
-        r.update(ok=True)
+        r.update(ok=True,persisted=True,background_only=True,original_foreground_preserved=True,
+                 input_keyboard_focus_preserved=True,input_focus_owner_kind='present',
+                 keyboard_focus_scope='focus_setter_through_save',credentials_changed=1,exports=0,imports=0,
+                 state={**q['expected'],'notes':q['notes']})
     elif op=='delete-redundant-note':
         s['writes']+=1; s['active'].remove(found[0]); s['deleted'].append(found[0]); r.update(ok=True,recoverable=True)
     else: r.update(ok=False,error='maintenance_operation_unsupported')

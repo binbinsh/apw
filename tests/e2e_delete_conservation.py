@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Actual CLI + isolated synthetic helper. No Apple/native UI is invoked.
 
-Failure specification for eliminating redundant absence requests: retain the
-precise Deleted-body failure gate, exact Deleted location and two independent
+Failure specification for eliminating redundant absence requests: a verified
+new preflight uses exact Deleted location directly; historical records retain
+the precise Deleted-body failure gate. Both retain two independent
 complete keeper reads surrounding one final Active-absence request (whose real
 native implementation still requires two fresh complete index frames). A missing
 keeper field/hash/body, reappearing Active candidate, location/error mismatch,
@@ -112,9 +113,11 @@ for line in sys.stdin:
             r=subprocess.run(cmd,env=env,capture_output=True,text=True,timeout=20);s=json.loads(store.read_text());entries=[json.loads(x) for x in journal.read_text().splitlines()] if journal.exists() else []
             checks={'command_outcome':(r.returncode==0)==success,'no_private_output':candidate['notes'] not in r.stdout+r.stderr and keeper['password'] not in r.stdout+r.stderr,
                     'no_delete_replay':s['writes']==(1 if fresh and name!='preexisting-deleted' else 0),'no_unexpected_mutation':set(s['calls'])<={'read','deleted-read','deleted-location-read','delete-redundant-note'}}
+            preservation_order=[['deleted-location-read','candidate'],['read','keeper'],['read','candidate'],['read','keeper']]
+            if name!='fresh-success':preservation_order=[['deleted-read','candidate']]+preservation_order
             if success and name not in ['full-body','unsupported-full-body']:
                 done=entries[-1];checks.update(keeper_twice=s['keeper_reads']==(3 if fresh else 2),final_active_absence_once=s['absence_reads']==1,
-                    minimal_preservation_order=s['call_roles'][-5:]==[['deleted-read','candidate'],['deleted-location-read','candidate'],['read','keeper'],['read','candidate'],['read','keeper']],
+                    minimal_preservation_order=s['call_roles'][-len(preservation_order):]==preservation_order,
                     conservation_mode=done.get('deletion_verification')==('content_preservation_deleted_location' if fresh else 'legacy_pending_content_preservation_deleted_location'),
                     content_verified=done.get('content_preservation_verified') is True,body_not_faked=done.get('deleted_body_verified') is False)
             if success and name in ['full-body','unsupported-full-body']:
@@ -136,12 +139,14 @@ for line in sys.stdin:
                 checks.update(done_repeat_succeeds=again.returncode==0 and ack.get('completed')==1 and ack.get('mutations')==0,
                     done_repeat_zero_deletes=after['writes']==before_repeat_writes and 'delete-redundant-note' not in new_calls,
                     done_repeat_journal_unchanged=journal.read_bytes()==before_repeat_journal,
-                    done_repeat_fresh_readonly_proof='read' in new_calls and 'deleted-read' in new_calls,
+                    done_repeat_fresh_readonly_proof='read' in new_calls and ('deleted-location-read' if name=='fresh-success' else 'deleted-read') in new_calls,
                     done_repeat_private_output_absent=candidate['notes'] not in again.stdout+again.stderr and keeper['password'] not in again.stdout+again.stderr)
                 if name not in ['full-body','unsupported-full-body']:
                     checks.update(done_repeat_conservation_rechecked=ack.get('content_preservation_verifications')==1 and ack.get('deleted_body_verifications')==0 and
                         new_calls.count('read')==3 and new_calls.count('deleted-location-read')==1,
-                        done_repeat_minimal_preservation_order=after['call_roles'][before_repeat_calls:]==[['deleted-read','candidate'],['deleted-location-read','candidate'],['read','keeper'],['read','candidate'],['read','keeper']])
+                        done_repeat_minimal_preservation_order=after['call_roles'][before_repeat_calls:]==preservation_order)
+                if name=='fresh-success':
+                    checks.update(new_preflight_no_body_request='deleted-read' not in s['calls'],done_repeat_no_body_request='deleted-read' not in new_calls)
                 checks['done_repeat_one_final_absence']=after['absence_reads']-before_repeat_absence==1
                 repeat={'command':shlex.join(cmd),'exit_status':again.returncode,'native_operations':new_calls,'journal_unchanged':journal.read_bytes()==before_repeat_journal}
             results.append({'case':name,'passed':all(checks.values()),'checks':checks,'command':shlex.join(cmd),'native_operations':s['calls'],'exit_status':r.returncode,'completed_journal_repeat':repeat})

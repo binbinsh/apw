@@ -66,7 +66,7 @@ for line in sys.stdin:
   value=json.load(open(os.environ['APW_TEST_STATE']));value['notes']=q['notes']
   with open(os.environ['APW_TEST_STATE'],'w') as f:json.dump(value,f)
   if os.environ['APW_TEST_MODE']=='lost-reply':sys.exit(0)
-  r.update(ok=True)
+  r.update(ok=True,persisted=True,background_only=True,original_foreground_preserved=True,input_keyboard_focus_preserved=True,input_focus_owner_kind='present',keyboard_focus_scope='focus_setter_through_save',credentials_changed=1,exports=0,imports=0,state=value)
  else: r.update(ok=False,error='maintenance_synthetic_mutation_forbidden')
  print(json.dumps(r),flush=True)
 ''')

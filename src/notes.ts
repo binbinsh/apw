@@ -3,18 +3,20 @@ import { APWError, Status } from "./const.ts";
 import { exchangeStatus, prepareExchangeComponent } from "./exchange.ts";
 
 function fail(): never { throw new APWError(Status.INVALID_PARAM, "exchange_notes_plan_invalid"); }
-export async function privateBytes(path: string): Promise<Uint8Array> {
+export async function privateBytes(path: string, exclusive = false): Promise<Uint8Array> {
   const before = await Deno.lstat(path);
   if (!before.isFile || before.isSymlink || before.uid !== Deno.uid() || !before.mode || (before.mode & 0o077) !== 0 || before.size > 32 * 1024 * 1024) fail();
   const file = await Deno.open(path, { read: true });
   try {
     const opened = await file.stat();
+    if (exclusive && (before.nlink !== 1 || opened.nlink !== 1)) fail();
     if (!opened.isFile || opened.uid !== Deno.uid() || !opened.mode || (opened.mode & 0o077) !== 0 || opened.ino !== before.ino || opened.dev !== before.dev || opened.size !== before.size) fail();
     const bytes = new Uint8Array(opened.size);
     let offset = 0;
     while (offset < bytes.length) { const n = await file.read(bytes.subarray(offset)); if (n === null || n === 0) fail(); offset += n; }
     const after = await file.stat();
     const pathAfter = await Deno.lstat(path);
+    if (exclusive && (after.nlink !== 1 || pathAfter.nlink !== 1)) fail();
     if (after.size !== opened.size || after.mtime?.getTime() !== opened.mtime?.getTime() || pathAfter.isSymlink || pathAfter.ino !== opened.ino || pathAfter.dev !== opened.dev) fail();
     return bytes;
   } finally { file.close(); }

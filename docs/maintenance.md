@@ -42,16 +42,29 @@ The compiled CLI/helper boundary tests pass. A live synthetic trial has verified
 exact reads and exposed an Apple editor behavior: AXValue updates the visible
 NotesField but does not persist its model. The replacement implementation uses
 complete AXSelectedText replacement with exact UTF-16 range and unchanged global
-focus checks. The new live notes write path still needs a successful Apple synthetic trial.
-Targeted live batch reads and individual recoverable deletion have been observed;
-content-preservation reconciliation has also succeeded for a historical pending
-operation. Uninterrupted batch cleanup remains under live verification. Exact bounded
-search has succeeded live, but a subsequent read-only review found its text
-submission unavailable and stopped before mutation. Search capability is not
-reliably established. The advertised search Confirm action was also refused in a
-background trial. In a separate self-owned SwiftUI fixture, successful AXValue
-and AXConfirm returned without updating the real Binding model. That experiment
-does not certify Apple operations.
+focus checks. The observed Apple NotesField does not support those selected-text
+setters. A separate, isolated synthetic trial of AXValue followed by the field's
+advertised AXConfirm and Save also failed independent persisted readback. Its
+original full state was independently verified afterward; that experiment was
+not added as a production fallback. Background notes writing is **not verified**,
+and no real companion record may be deleted on the strength of a successful
+setter or Save acknowledgement.
+
+Live batch reads, consecutive recoverable deletions, and read-only reconciliation
+of interrupted operations have now succeeded. Every accepted deletion retained
+the complete candidate body and source markers in a freshly verified keeper.
+This establishes the narrow redundant-note cleanup path, not arbitrary login,
+passkey, or shared-record deletion. Qualified completed checkpoints avoid
+repeating finished operations; uncertain outcomes still require reconciliation.
+
+Exact bounded search has succeeded live, but a subsequent read-only review found
+its text submission unavailable and stopped before mutation. Search capability
+is not reliably established. Background maintenance therefore uses the complete
+unfiltered index described above. The advertised search Confirm action was also
+refused in a background trial. In a separate self-owned SwiftUI fixture,
+successful AXValue and AXConfirm returned without updating the real Binding
+model. A self-owned fixture's ability to receive process-directed keyboard input
+does not establish a safe, focused input receiver inside Apple Passwords.
 Readiness reports distinguish editor, unavailable and incomplete views;
 an unavailable context does not establish locking from text such as `unlock`.
 static detail labels are not classified as editable fields. Each request obtains

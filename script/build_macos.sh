@@ -26,6 +26,7 @@ if [[ "${1:-}" == --verify ]]; then
   python3 tests/e2e_native_deleted_cache_miss.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-deleted-cache-miss.json"
   python3 tests/e2e_native_category_transition_order.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-category-transition-order.json"
   python3 tests/e2e_native_deleted_arrival.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-deleted-arrival.json"
+  python3 tests/e2e_native_readonly_context_wait.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-readonly-context-wait.json"
   python3 tests/e2e_native_current_absence.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-current-absence.json"
   python3 tests/e2e_native_deleted_location.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-deleted-location.json"
   python3 tests/e2e_native_search_clear_recovery.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-search-clear-recovery.json"

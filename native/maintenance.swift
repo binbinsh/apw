@@ -152,6 +152,9 @@ struct CollisionSafeVisited<Element> {
 func nativeVisited()->CollisionSafeVisited<AXUIElement> {
  CollisionSafeVisited(hash:{CFHash($0)},equal:{CFEqual($0,$1)})
 }
+func readonlyContextObservationPermits(complete:Bool,contextAvailable:Bool,ownerUnchanged:Bool,windowBound:Bool,processBound:Bool,noEditor:Bool,deadlineValid:Bool)->Bool {
+ complete && contextAvailable && ownerUnchanged && windowBound && processBound && noEditor && deadlineValid
+}
 func editorObservationVerified(opened:Bool,ownerValid:Bool,fieldsComplete:Bool,snapshotComplete:Bool)->Bool {
  opened && ownerValid && fieldsComplete && snapshotComplete
 }
@@ -414,6 +417,22 @@ if args==["--policy-test"] {
    let firstBytes=try? JSONSerialization.data(withJSONObject:first),let secondBytes=try? JSONSerialization.data(withJSONObject:second),
    let before=try? JSONDecoder().decode(CurrentCategoryIndexFrame.self,from:firstBytes),let after=try? JSONDecoder().decode(CurrentCategoryIndexFrame.self,from:secondBytes) else{exit(2)}
   result=categoryModelPairPermits(before,after,referencesSame:q["references_same"] as? Bool ?? false)
+ case "readonly-context-wait":
+  guard let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
+  var incomplete=q["prior_incomplete"] as? Bool ?? false
+  let prior=incomplete;var outcome="unverified"
+  for frame in frames {
+   guard frame["owner_unchanged"] as? Bool==true,frame["deadline_valid"] as? Bool==true else{break}
+   let observed=independentComplete(get:{incomplete},set:{incomplete=$0}) {()->String? in
+    for code in frame["codes"] as? [Int32] ?? [] {if let error=AXError(rawValue:code),nativeReadErrorRefuses(error,required:false) {incomplete=true}}
+    guard readonlyContextObservationPermits(complete:frame["complete"] as? Bool ?? false,contextAvailable:frame["context_available"] as? Bool ?? false,
+     ownerUnchanged:frame["owner_unchanged"] as? Bool ?? false,windowBound:frame["window_bound"] as? Bool ?? false,
+     processBound:frame["process_bound"] as? Bool ?? false,noEditor:frame["no_editor"] as? Bool ?? false,deadlineValid:frame["deadline_valid"] as? Bool ?? false) else{return nil}
+    return q["kind"] as? String=="category" ? (frame["category_matches"] as? Bool==true ? "category_true":"category_false"):"context"
+   }
+   if let observed,let value=observed {outcome=value;break}
+  }
+  result=["outcome":outcome,"prior_preserved":incomplete==prior]
  case "category-clear-wait-first":
   result=categoryClearWaitFirst(background:q["background"] as? Bool ?? false,pendingNavigation:q["pending_navigation"] as? Bool ?? false,initialQueryEmpty:q["query_empty"] as? Bool ?? false)
  case "deleted-expected-arrival":
@@ -790,6 +809,34 @@ func context(_ root:AXUIElement)->(AXUIElement,AXUIElement)? {
  let f=all.filter{text($0,kAXRoleAttribute)=="AXToolbar"}.flatMap{nodes($0)}.filter{text($0,kAXRoleAttribute)=="AXTextField" && text($0,kAXSubroleAttribute)=="AXSearchField"}
  let lists=all.filter{["AXOutline","AXTable"].contains(text($0,kAXRoleAttribute)) && text($0,kAXIdentifierAttribute)=="AccountListView"}
  return f.count==1 && lists.count==1 ? (f[0],lists[0]):nil
+}
+func awaitReadonlyListObservation<T>(_ root:AXUIElement,_ observation:(AXUIElement,AXUIElement)->T?)throws->T {
+ let requestDeadline=deadline,until=min(deadline,Date(timeIntervalSinceNow:3))
+ deadline=until;defer{deadline=requestDeadline}
+ while Date()<until,front() {
+  if let observed=completeDiscovery({()->T? in
+   guard let (search,list)=context(root),let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,
+    text(windows[0],kAXSubroleAttribute)=="AXStandardWindow" else{return nil}
+   let ns=nodes(root)
+   let noEditor = !ns.contains{["TitleField","UserNameField","PasswordField","NotesField"].contains(text($0,kAXIdentifierAttribute)) && ["AXTextField","AXTextArea","AXComboBox"].contains(text($0,kAXRoleAttribute))}
+   let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
+   var processBound=running.count==1 && running[0].processIdentifier==appPID && apple(appPID)
+   for element in [root,windows[0],search,list] {
+    var pid:pid_t=0
+    let code=AXUIElementGetPid(element,&pid);observeNativeError(code,required:true)
+    processBound=processBound && code == .success && pid==appPID
+   }
+   let windowBound=notesProbeAncestorBound(search,windows[0]) && notesProbeAncestorBound(list,windows[0])
+   guard readonlyContextObservationPermits(complete:!nativeObservationIncomplete,contextAvailable:true,ownerUnchanged:front(),windowBound:windowBound,
+    processBound:processBound,noEditor:noEditor,deadlineValid:Date()<until) else{return nil}
+   return observation(search,list)
+  }),let value=observed {
+   guard Date()<until,front() else{break}
+   return value
+  }
+  pause(0.04)
+ }
+ throw nativeFailure("context_observation_unverified")
 }
 func query(_ previous:AXUIElement,_ q:String)->Bool { context(AXUIElementCreateApplication(appPID)).map { text($0.0,kAXValueAttribute)==boundQuery } ?? false }
 func fields(_ ns:[AXUIElement])->[String:String] {
@@ -1827,13 +1874,10 @@ func currentCompleteCategoryLabels(_ root:AXUIElement,_ category:String)throws->
  throw nativeFailure("current_absence_proof_incomplete")
 }
 func selectCategory(_ root:AXUIElement,_ category:String,buildIndex:Bool=true)throws {
- guard let contextFrame=completeDiscovery({context(root)}),contextFrame != nil else{throw nativeFailure("locked_or_user_editor")}
- let initialQueryEmpty=buildIndex && backgroundOwnerPID != nil && completeDiscovery({()->Bool in
-  guard let (search,_)=context(root),let query=attr(search,kAXValueAttribute) as? String else{return false}
-  return query.isEmpty
- })==true
- let previousEvidence=completeDiscovery({categoryEvidence(root,category)})
- let navigation=categorySelectionRoute(actualMatches:previousEvidence?.0)
+ let initialQuery:String=try awaitReadonlyListObservation(root){search,_ in attr(search,kAXValueAttribute) as? String}
+ let initialQueryEmpty=buildIndex && backgroundOwnerPID != nil && initialQuery.isEmpty
+ let previousEvidence:(Bool,Int?)=try awaitReadonlyListObservation(root){_,_ in categoryEvidence(root,category)}
+ let navigation=categorySelectionRoute(actualMatches:previousEvidence.0)
  try require(navigation != "hold","category_observation_incomplete")
  if navigation=="bind" {currentCategory=category}
  if navigation=="navigate" {
@@ -1857,16 +1901,19 @@ func selectCategory(_ root:AXUIElement,_ category:String,buildIndex:Bool=true)th
   // empty-query ready observation; no query setter is enabled here.
   try waitForCategoryModel(root,category);categoryNavigationNeedsProof=false
  }
- guard context(root) != nil else{throw nativeFailure("locked_or_user_editor")}
+ _ = try awaitReadonlyListObservation(root){search,list in (search,list)}
  // An empty visible field with a stale zero-result model is not All. The
  // complete initial-model policy keeps normal fresh nonempty All lists usable.
  if buildIndex {
   try require(clearSearchQuery(root),"list_preparation_failed");boundQuery=""
  }
  if categoryNavigationNeedsProof {try waitForCategoryModel(root,category);categoryNavigationNeedsProof=false}
- try require(context(root).map{text($0.0,kAXValueAttribute).isEmpty} ?? false,"filtered_list_refused")
- boundQuery=""
- guard let (_,list)=context(root),let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=3000 else{throw nativeFailure("list_unavailable")}
+ let finalModel:(String,[AXUIElement])=try awaitReadonlyListObservation(root){search,list in
+  guard let query=attr(search,kAXValueAttribute) as? String,let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=3000 else{return nil}
+  return (query,rows)
+ }
+ try require(finalModel.0.isEmpty,"filtered_list_refused")
+ boundQuery="";let rows=finalModel.1
  let cached=category=="active" ? activeLabels:deletedLabels
  if let cached {
   // Equal count permits routing only. A miss must independently scan the
@@ -1896,7 +1943,7 @@ func snapshot(_ key:[String:String],_ n:NativeRead)throws->[String:Any] {
 func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=false,guardedExpected:[String:Any]?=nil)throws->(AXUIElement,NativeRead,[String:Any]) {
  let root=try freshRoot();try selectCategory(root,category,buildIndex:false)
  guard let title=key["title"],!title.isEmpty,let user=key["username"] else{throw nativeFailure("identity_invalid")}
- guard let (search,_) = context(root) else{throw nativeFailure("locked_or_user_editor")}
+ let (search,_)=try awaitReadonlyListObservation(root){search,list in (search,list)}
  var rangeSettable=DarwinBoolean(false),textSettable=DarwinBoolean(false),valueSettable=DarwinBoolean(false)
  let rangeSupported=AXUIElementIsAttributeSettable(search,kAXSelectedTextRangeAttribute as CFString,&rangeSettable) == .success && rangeSettable.boolValue
  let textSupported=AXUIElementIsAttributeSettable(search,kAXSelectedTextAttribute as CFString,&textSettable) == .success && textSettable.boolValue
@@ -1923,8 +1970,8 @@ func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=fal
   // The search field's selected-text attributes are not writable on every
   // macOS release. Reuse one complete category index in this helper session.
   // Never infer uniqueness from a partial index, and never scan per record.
-  guard let (freshSearch,_) = context(root) else{throw nativeFailure("locked_or_user_editor")}
-  if !text(freshSearch,kAXValueAttribute).isEmpty {
+  let freshQuery:String=try awaitReadonlyListObservation(root){search,_ in attr(search,kAXValueAttribute) as? String}
+  if !freshQuery.isEmpty {
    try require(clearSearchQuery(root),"list_preparation_failed")
   }
   try selectCategory(root,category,buildIndex:true)

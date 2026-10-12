@@ -245,6 +245,12 @@ including the entire candidate body and every source identifier. The journal
 records `content_preservation_verified:true` and `deleted_body_verified:false`.
 It does not claim to have read or verified the hidden Deleted body. Existing
 uncertain operations are reconciled read-only and never automatically re-deleted.
+The location proof runs in this order: precise unavailable-body observation,
+exact Deleted location, first complete keeper read, one final Active-absence
+request, second complete keeper read. The native absence request still requires
+two fresh complete stable index frames. Keeper equality and full hashes surround
+that scan; no earlier duplicate absence request is needed. Full Deleted-body
+proof retains its own final absence and complete keeper check.
 
 Normal login deduplication and passkey/group inventory are not yet implemented.
 A count alone is not proof of identity coverage.

@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Actual CLI + isolated synthetic helper. No Apple/native UI is invoked."""
+"""Actual CLI + isolated synthetic helper. No Apple/native UI is invoked.
+
+Failure specification for eliminating redundant absence requests: retain the
+precise Deleted-body failure gate, exact Deleted location and two independent
+complete keeper reads surrounding one final Active-absence request (whose real
+native implementation still requires two fresh complete index frames). A missing
+keeper field/hash/body, reappearing Active candidate, location/error mismatch,
+or timeout must not yield done. Full-body proof keeps its own final absence.
+Never repeat a mutation when reconciling an intent or completed checkpoint.
+"""
 import argparse, copy, hashlib, json, os, pathlib, shlex, subprocess, tempfile
 
 def sha(x):return hashlib.sha256(json.dumps(x,ensure_ascii=False,sort_keys=True,separators=(',',':')).encode()).hexdigest()
@@ -21,6 +30,7 @@ def sha(x):return hashlib.sha256(json.dumps(x,ensure_ascii=False,sort_keys=True,
 p=pathlib.Path(os.environ['APW_TEST_STORE'])
 for line in sys.stdin:
  q=json.loads(line);s=json.loads(p.read_text());op=q['op'];mode=s['mode'];k=q.get('key');s['calls'].append(op)
+ s['call_roles'].append([op,'keeper' if k==s['keeper']['key'] else 'candidate' if k==s['candidate']['key'] else 'other'])
  r={'id':q['id'],'app_activated':False,'backend':'synthetic'}
  def failure(code):r.update(ok=False,error='maintenance_'+code)
  rows=s['deleted'] if op in ['deleted-read','deleted-location-read'] else s['active'];found=[v for v in rows if v['key']==k]
@@ -36,7 +46,7 @@ for line in sys.stdin:
   else:r.update(ok=True,state=value)
  elif op=='read' and k==s['candidate']['key'] and not found:
   s['absence_reads']+=1
-  if mode=='active-reappears' and s['absence_reads']>=2:r.update(ok=True,state=s['candidate'])
+  if mode=='active-reappears':r.update(ok=True,state=s['candidate'])
   elif mode=='active-timeout':failure('helper_timeout')
   else:failure('item_not_found')
  elif op=='deleted-location-read':
@@ -96,16 +106,20 @@ for line in sys.stdin:
                     sidecar=pathlib.Path(str(journal)+'.'+op['id']+'.before.json');write(sidecar,{'format':'apw-item-snapshot-v1','sha256':'0'*64,'state':c});intent['before_snapshot_path']=str(sidecar)
                 journal.write_text(json.dumps(intent)+'\n'+json.dumps({**intent,'event':'uncertain'})+'\n');journal.chmod(0o600)
             write(store,{'candidate':c,'keeper':keep,'active':[keep,c] if fresh else [keep],'deleted':[c] if not fresh or name=='preexisting-deleted' else [],
-                         'mode':name,'calls':[],'writes':0,'keeper_reads':0,'absence_reads':0,'snapshot_before_dispatch':False})
+                         'mode':name,'calls':[],'call_roles':[],'writes':0,'keeper_reads':0,'absence_reads':0,'snapshot_before_dispatch':False})
             env={**os.environ,'APW_MAINTENANCE_HELPER':str(helper),'APW_TEST_STORE':str(store),'APW_TEST_JOURNAL':str(journal),'APW_DATA_DIR':str(d)}
             cmd=[binary,'batch','run','--apply','--plan',str(planpath),'--journal',str(journal)]
             r=subprocess.run(cmd,env=env,capture_output=True,text=True,timeout=20);s=json.loads(store.read_text());entries=[json.loads(x) for x in journal.read_text().splitlines()] if journal.exists() else []
             checks={'command_outcome':(r.returncode==0)==success,'no_private_output':candidate['notes'] not in r.stdout+r.stderr and keeper['password'] not in r.stdout+r.stderr,
                     'no_delete_replay':s['writes']==(1 if fresh and name!='preexisting-deleted' else 0),'no_unexpected_mutation':set(s['calls'])<={'read','deleted-read','deleted-location-read','delete-redundant-note'}}
             if success and name not in ['full-body','unsupported-full-body']:
-                done=entries[-1];checks.update(keeper_twice=s['keeper_reads']>=(3 if fresh else 2),active_rechecked=s['absence_reads']>=2,
+                done=entries[-1];checks.update(keeper_twice=s['keeper_reads']==(3 if fresh else 2),final_active_absence_once=s['absence_reads']==1,
+                    minimal_preservation_order=s['call_roles'][-5:]==[['deleted-read','candidate'],['deleted-location-read','candidate'],['read','keeper'],['read','candidate'],['read','keeper']],
                     conservation_mode=done.get('deletion_verification')==('content_preservation_deleted_location' if fresh else 'legacy_pending_content_preservation_deleted_location'),
                     content_verified=done.get('content_preservation_verified') is True,body_not_faked=done.get('deleted_body_verified') is False)
+            if success and name in ['full-body','unsupported-full-body']:
+                checks.update(full_body_final_absence_once=s['absence_reads']==1,
+                    full_body_proof_order=s['call_roles'][-3:]==[['deleted-read','candidate'],['read','candidate'],['read','keeper']])
             if success and fresh:checks['snapshot_precedes_dispatch']=s['snapshot_before_dispatch']
             if not success:checks['no_done']=not entries or entries[-1]['event']!='done'
             if name.startswith('deleted-error-'):checks['no_wrong_error_fallback']='deleted-location-read' not in s['calls']
@@ -114,7 +128,7 @@ for line in sys.stdin:
             if success:
                 # Exercise the actual completed-journal CLI branch; neither a
                 # mock assertion nor the previous done flag substitutes for it.
-                before_repeat_journal=journal.read_bytes();before_repeat_calls=len(s['calls']);before_repeat_writes=s['writes']
+                before_repeat_journal=journal.read_bytes();before_repeat_calls=len(s['calls']);before_repeat_writes=s['writes'];before_repeat_absence=s['absence_reads']
                 again=subprocess.run(cmd,env=env,capture_output=True,text=True,timeout=20);after=json.loads(store.read_text())
                 new_calls=after['calls'][before_repeat_calls:]
                 try:ack=json.loads(again.stdout)
@@ -126,7 +140,9 @@ for line in sys.stdin:
                     done_repeat_private_output_absent=candidate['notes'] not in again.stdout+again.stderr and keeper['password'] not in again.stdout+again.stderr)
                 if name not in ['full-body','unsupported-full-body']:
                     checks.update(done_repeat_conservation_rechecked=ack.get('content_preservation_verifications')==1 and ack.get('deleted_body_verifications')==0 and
-                        new_calls.count('read')>=4 and new_calls.count('deleted-location-read')==1)
+                        new_calls.count('read')==3 and new_calls.count('deleted-location-read')==1,
+                        done_repeat_minimal_preservation_order=after['call_roles'][before_repeat_calls:]==[['deleted-read','candidate'],['deleted-location-read','candidate'],['read','keeper'],['read','candidate'],['read','keeper']])
+                checks['done_repeat_one_final_absence']=after['absence_reads']-before_repeat_absence==1
                 repeat={'command':shlex.join(cmd),'exit_status':again.returncode,'native_operations':new_calls,'journal_unchanged':journal.read_bytes()==before_repeat_journal}
             results.append({'case':name,'passed':all(checks.values()),'checks':checks,'command':shlex.join(cmd),'native_operations':s['calls'],'exit_status':r.returncode,'completed_journal_repeat':repeat})
     report={'command':shlex.join(['python3',str(pathlib.Path(__file__).resolve()),'--bin',binary,'--report',str(pathlib.Path(a.report).resolve())]),

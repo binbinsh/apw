@@ -460,7 +460,6 @@ async function verifyRedundantDeletion(native: Native, o: Operation, before: Sta
     // An unsupported preflight on a new delete preserves legacy full-body
     // compatibility, but never permits the weaker historical identity scope.
     if (preflightAbsent === false) fail("outcome_requires_review");
-    await exactActiveAbsence(native, o.target);
     const result = await native.call("deleted-location-read", {key:o.target, expected:before});
     const location = result.location as Record<string,unknown> | undefined;
     if (result.verification !== "deleted_note_location_only" || result.body_verified !== false || Object.hasOwn(result,"state") ||
@@ -608,7 +607,6 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
             await verifySnapshotOutput(file!,journalPath,opened);
             skippedCompleted++;continue;
           }
-          await exactActiveAbsence(native,o.target);
           const proof=await verifyRedundantDeletion(native,o,deletedBefore,intent.deleted_preflight_absent);
           contentPreservationVerifications++;if(proof.deleted_body_verified)deletedBodyVerifications++;
           if (last.event !== "done") await append(o, "done",undefined,undefined,undefined,proof);

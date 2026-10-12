@@ -61,6 +61,57 @@ func addressedSelectionScope(role:String,identifier:String,subrole:String)->Bool
  (identifier=="NotesField" && ["AXTextArea","AXTextField"].contains(role)) || (subrole=="AXSearchField" && role=="AXTextField")
 }
 func requiresQueryClear(fullIndex:Bool,queryEmpty:Bool)->Bool {fullIndex && !queryEmpty}
+func nativeReadErrorRefuses(_ code:AXError,required:Bool)->Bool {
+ [AXError.cannotComplete,AXError.invalidUIElement,AXError.illegalArgument].contains(code) || (required && code != .success)
+}
+// A rejected frame is not evidence for a later frame. Preserve the outer
+// request's state, while evaluating each fresh observation independently.
+func independentComplete<T>(get:()->Bool,set:(Bool)->Void,operation:()->T)->T? {
+ let prior=get();set(false)
+ let result=operation(),complete = !get();set(prior)
+ return complete ? result:nil
+}
+struct SearchPreparationFrame {
+ let complete,queryMatches,categoryMatches,ownerUnchanged:Bool
+ let rawCount,publishedCount:Int
+ let labels:[[String]]
+ let targetPresent:Bool
+}
+struct SearchPreparationWitness {
+ let stage:String;let beforeCount,cachedRawCount:Int
+ var previous:SearchPreparationFrame?
+ mutating func observe(_ frame:SearchPreparationFrame)->Bool {
+  let bound=frame.complete && frame.queryMatches && frame.categoryMatches && frame.ownerUnchanged && frame.rawCount>=0 && frame.rawCount<=3000
+  let eligible:Bool
+  switch stage {
+  case "empty_witness":eligible=bound && frame.rawCount==0
+  case "target_model":eligible=bound && frame.rawCount>0 && frame.rawCount<=100 && frame.labels.count==frame.rawCount && frame.targetPresent
+  case "clear_model":eligible=bound && (frame.rawCount>beforeCount || (cachedRawCount>=0 && frame.rawCount==cachedRawCount && (frame.rawCount>0 || frame.publishedCount==0)))
+  default:eligible=false
+  }
+  guard eligible else{previous=nil;return false}
+  defer{previous=frame}
+  guard let old=previous,old.rawCount==frame.rawCount else{return false}
+  return stage != "target_model" || old.labels==frame.labels
+ }
+}
+func searchClearInitialReady(_ frame:SearchPreparationFrame,queryEmpty:Bool,cachedRawCount:Int,modelNeedsProof:Bool)->Bool {
+ guard frame.complete,queryEmpty,frame.queryMatches,frame.categoryMatches,frame.ownerUnchanged,frame.rawCount>=0,frame.rawCount<=3000 else{return false}
+ if cachedRawCount==frame.rawCount {return frame.rawCount>0 || frame.publishedCount==0}
+ return frame.rawCount>0 && !modelNeedsProof
+}
+struct DeletedNoteFrame:Decodable {
+ let selected_exact,title_matches,note_matches,recovery_unique,complete:Bool
+ var verified:Bool {selected_exact && title_matches && note_matches && recovery_unique && complete}
+}
+struct DeletedNoteWitness {
+ var previousVerified=false
+ mutating func observe(_ frame:DeletedNoteFrame)->Bool {
+  let accepted=previousVerified && frame.verified
+  previousVerified=frame.verified
+  return accepted
+ }
+}
 func recoveryVerificationFieldsSafe(_ roles:[String])->Bool {
  !roles.contains{["AXTextField","AXTextArea","AXComboBox"].contains($0)}
 }
@@ -190,6 +241,26 @@ func privateData(_ path:String)->Data? {
  return try? h.readToEnd()
 }
 let args=Array(CommandLine.arguments.dropFirst())
+if args==["--search-replay-test"] {
+ guard let line=readLine(),let data=line.data(using:.utf8),let q=try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+  let stage=q["stage"] as? String,["empty_witness","target_model","clear_model"].contains(stage),let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
+ var incomplete=q["prior_incomplete"] as? Bool ?? false
+ let original=incomplete
+ var witness=SearchPreparationWitness(stage:stage,beforeCount:q["before_count"] as? Int ?? -1,cachedRawCount:q["cached_raw_count"] as? Int ?? -1)
+ var accepted=false
+ for frame in frames {
+  let observation=independentComplete(get:{incomplete},set:{incomplete=$0}) {()->SearchPreparationFrame in
+   for code in frame["codes"] as? [Int32] ?? [] {
+    if let error=AXError(rawValue:code),nativeReadErrorRefuses(error,required:false) {incomplete=true}
+   }
+   return SearchPreparationFrame(complete:true,queryMatches:frame["query_matches"] as? Bool ?? false,categoryMatches:frame["category_matches"] as? Bool ?? false,ownerUnchanged:frame["owner_unchanged"] as? Bool ?? false,rawCount:frame["raw_count"] as? Int ?? -1,publishedCount:frame["published_count"] as? Int ?? -1,labels:frame["labels"] as? [[String]] ?? [],targetPresent:frame["target_present"] as? Bool ?? false)
+  }
+  let failed=SearchPreparationFrame(complete:false,queryMatches:false,categoryMatches:false,ownerUnchanged:false,rawCount:-1,publishedCount:-1,labels:[],targetPresent:false)
+  if witness.observe(observation ?? failed) {accepted=true;break}
+ }
+ let bytes=try! JSONSerialization.data(withJSONObject:["accepted":accepted,"prior_preserved":incomplete==original,"apple_accessed":false],options:.sortedKeys)
+ print(String(data:bytes,encoding:.utf8)!);exit(0)
+}
 // Pure entry-point verification runs before AppKit initializes or any Apple
 // process is inspected. The test exercises the same policy used below.
 if args==["--policy-test"] {
@@ -204,6 +275,14 @@ if args==["--policy-test"] {
  case "recoverable-dialog":result=recoverableDialog(words:q["words"] as? [String] ?? [],ordinaryButton:q["ordinary_button"] as? Bool ?? false,permanentButton:q["permanent_button"] as? Bool ?? false)
  case "selection-scope":result=addressedSelectionScope(role:q["role"] as? String ?? "",identifier:q["identifier"] as? String ?? "",subrole:q["subrole"] as? String ?? "")
  case "query-clear-policy":result=requiresQueryClear(fullIndex:q["full_index"] as? Bool ?? false,queryEmpty:q["query_empty"] as? Bool ?? false)
+ case "search-clear-initial":
+  let frame=SearchPreparationFrame(complete:q["complete"] as? Bool ?? false,queryMatches:q["query_empty"] as? Bool ?? false,categoryMatches:q["category_matches"] as? Bool ?? false,ownerUnchanged:q["owner_unchanged"] as? Bool ?? false,rawCount:q["raw_count"] as? Int ?? -1,publishedCount:q["published_count"] as? Int ?? -1,labels:[],targetPresent:false)
+  result=searchClearInitialReady(frame,queryEmpty:q["query_empty"] as? Bool ?? false,cachedRawCount:q["cached_raw_count"] as? Int ?? -1,modelNeedsProof:q["model_needs_proof"] as? Bool ?? false)
+ case "deleted-frame-pair":
+  guard let frames=q["frames"] as? [[String:Any]],frames.count<=128,let bytes=try? JSONSerialization.data(withJSONObject:frames),let decoded=try? JSONDecoder().decode([DeletedNoteFrame].self,from:bytes) else{exit(2)}
+  var witness=DeletedNoteWitness(),accepted=false
+  for frame in decoded {if witness.observe(frame) {accepted=true;break}}
+  result=accepted
  case "editor-code-guard":result=recoveryVerificationFieldsSafe(q["roles"] as? [String] ?? [])
  case "notes-write-policy":result=notesWritePermits(role:q["role"] as? String ?? "",rangeCode:q["range_code"] as? Int ?? -1,textCode:q["text_code"] as? Int ?? -1,valueCode:q["value_code"] as? Int ?? -1,rangeSettable:q["range_settable"] as? Bool ?? false,textSettable:q["text_settable"] as? Bool ?? false,twoFrames:q["two_frames"] as? Bool ?? false,fieldsEqual:q["fields_equal"] as? Bool ?? false)
  case "category-caption":result=categoryCaptionMatches(q["value"] as? String ?? "",q["category"] as? String ?? "")
@@ -235,9 +314,6 @@ report["native_global_timeout_seconds"]=0.25
 report["native_timeout_scope"]="helper_process"
 var nativeObservationIncomplete=false
 struct NativeErrorObservation:Decodable {let code:Int32;let required:Bool}
-func nativeReadErrorRefuses(_ code:AXError,required:Bool)->Bool {
- [AXError.cannotComplete,AXError.invalidUIElement,AXError.illegalArgument].contains(code) || (required && code != .success)
-}
 func observeNativeError(_ code:AXError,required:Bool=false) {
  if nativeReadErrorRefuses(code,required:required) {
   nativeObservationIncomplete=true
@@ -246,12 +322,9 @@ func observeNativeError(_ code:AXError,required:Bool=false) {
  }
 }
 func completeDiscovery<T>(_ operation:()->T)->T? {
- let prior=nativeObservationIncomplete
- nativeObservationIncomplete=false
- let result=operation(),complete = !nativeObservationIncomplete
- nativeObservationIncomplete=prior
- if !complete {report["discarded_incomplete_discovery_scans"]=(report["discarded_incomplete_discovery_scans"] as? Int ?? 0)+1}
- return complete ? result:nil
+ let result=independentComplete(get:{nativeObservationIncomplete},set:{nativeObservationIncomplete=$0},operation:operation)
+ if result==nil {report["discarded_incomplete_discovery_scans"]=(report["discarded_incomplete_discovery_scans"] as? Int ?? 0)+1}
+ return result
 }
 struct DiscoveryScopeObservation:Decodable {let prior_incomplete:Bool;let codes:[Int32]}
 var deadline=Date(timeIntervalSinceNow:90)
@@ -968,6 +1041,7 @@ var indexedCategory=""
 var indexedQuery=""
 var failedIndexCategories=Set<String>()
 var valueSearchAvailable=true
+var searchModelNeedsProof=false
 var ownEditor:(AXUIElement,NativeRead)?
 var ownEditorFields:[String:String]?
 var ownNotesProbeExpected:[String:Any]?
@@ -1166,35 +1240,82 @@ func boundedClick(_ node:AXUIElement,_ root:AXUIElement)->Bool {
  if let expression=try? NSRegularExpression(pattern:"\\((-?[0-9]+)\\)"),let match=expression.matches(in:diagnostic,range:NSRange(diagnostic.startIndex...,in:diagnostic)).last,let range=Range(match.range(at:1),in:diagnostic) {report["bounded_click_bridge_error_code"]=Int(diagnostic[range])}
  return p.terminationStatus==0 && front() && String(data:output.fileHandleForReading.readDataToEndOfFile(),encoding:.utf8)?.trimmingCharacters(in:.whitespacesAndNewlines)=="clicked"
 }
+// Whole query/category/model frames have independent completeness. No row
+// labels or query values enter these bounded structural diagnostics.
+func searchPreparationFrame(_ root:AXUIElement,phase:String,query:String,category:String,withLabels:Bool,cachedRawCount:Int,owner:()->Bool)->SearchPreparationFrame {
+ var queryMatches=false,categoryMatches=false,ownerUnchanged=false,rawCount = -1,publishedCount = -1,labels:[[String]]=[]
+ let before=report["native_incomplete_error_counts"] as? [String:Int] ?? [:]
+ let complete=completeDiscovery {()->Bool in
+  guard let (search,list)=context(root),let value=attr(search,kAXValueAttribute) as? String,
+   let rows=attr(list,kAXRowsAttribute) as? [AXUIElement] else{return false}
+  queryMatches=value==query;rawCount=rows.count
+  let categoryObservation=categoryEvidence(root,category)
+  categoryMatches=categoryObservation.0;publishedCount=categoryObservation.1 ?? -1
+  if withLabels,queryMatches,categoryMatches,rows.count<=100 {labels=rows.map{rowValues($0)}}
+  ownerUnchanged=owner()
+  return true
+ }==true
+ let after=report["native_incomplete_error_counts"] as? [String:Int] ?? [:]
+ let errors=after.keys.sorted().compactMap {key->[String:Int]? in
+  let count=after[key,default:0]-before[key,default:0]
+  guard count>0,let code=Int(key),abs(code)<=100000000 else{return nil}
+  return ["code":code,"count":min(6000,count)]
+ }
+ let diagnostic:[String:Any]=["phase":phase,"complete":complete,"query_matches":queryMatches,"category_matches":categoryMatches,"owner_unchanged":ownerUnchanged,"raw_count":min(3000,rawCount),"published_count":publishedCount,"cached_raw_count":cachedRawCount,"native_errors":Array(errors.prefix(8))]
+ var frames=report["search_model_frames"] as? [[String:Any]] ?? [];frames.append(diagnostic)
+ // Keep each phase visible: a later clear timeout must not evict all of the
+ // failed sentinel evidence. Three phases × five recent frames is bounded.
+ report["search_model_frames"]=["empty_witness","target_model","clear_model"].flatMap { stage in
+  Array(frames.filter{$0["phase"] as? String==stage}.suffix(5))
+ }
+ var counts=report["search_model_frame_counts"] as? [String:Int] ?? ["empty_witness":0,"target_model":0,"clear_model":0];counts[phase]=min(1024,counts[phase,default:0]+1)
+ report["search_model_frame_counts"]=counts
+ return SearchPreparationFrame(complete:complete,queryMatches:queryMatches,categoryMatches:categoryMatches,ownerUnchanged:ownerUnchanged,rawCount:rawCount,publishedCount:publishedCount,labels:labels,targetPresent:withLabels && labels.contains{$0.contains(query)})
+}
 func clearSearchQuery(_ root:AXUIElement)->Bool {
- guard let (field,list)=context(root) else{return false}
- let old=text(field,kAXValueAttribute)
- if old.isEmpty {boundQuery="";return !nativeObservationIncomplete}
- guard let before=attr(list,kAXRowsAttribute) as? [AXUIElement] else{return false}
- report["search_clear_before_count"]=before.count
- let known=["取消","Cancel","清除","Clear","清除搜索","Clear Search","取消搜索","Cancel Search","清空搜索"]
- guard let matches=completeDiscovery({nodes(field,prune:false).filter{n in
-  text(n,kAXRoleAttribute)=="AXButton" && values([n]).contains{known.contains($0)}
- }}),matches.count==1 else{report["search_clear_failure"]="clear_button_ambiguous";return false}
- guard boundedClick(matches[0],root) else{report["search_clear_failure"]="clear_action_refused";return false}
- let until=min(deadline,Date(timeIntervalSinceNow:4));var lastCount:Int?
+ let owner=NSWorkspace.shared.frontmostApplication?.processIdentifier,keyboard=focusPID()
+ guard let initial=completeDiscovery({()->(AXUIElement,String,SearchPreparationFrame)? in
+  guard let (field,list)=context(root),let old=attr(field,kAXValueAttribute) as? String,let rows=attr(list,kAXRowsAttribute) as? [AXUIElement] else{return nil}
+  let category=categoryEvidence(root,currentCategory)
+  let frame=SearchPreparationFrame(complete:true,queryMatches:old.isEmpty,categoryMatches:category.0,ownerUnchanged:front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard,rawCount:rows.count,publishedCount:category.1 ?? -1,labels:[],targetPresent:false)
+  return (field,old,frame)
+ }),let (field,old,initialFrame)=initial else{return false}
+ guard initialFrame.categoryMatches,initialFrame.ownerUnchanged,initialFrame.rawCount>=0,initialFrame.rawCount<=3000 else{return false}
+ let cached=currentCategory=="deleted" ? deletedLabels?.count:activeLabels?.count
+ if searchClearInitialReady(initialFrame,queryEmpty:old.isEmpty,cachedRawCount:cached ?? -1,modelNeedsProof:searchModelNeedsProof) {boundQuery="";return true}
+ let beforeCount=initialFrame.rawCount
+ report["search_clear_before_count"]=beforeCount
+ var range=DarwinBoolean(false),textSettable=DarwinBoolean(false)
+ let rangeCode=AXUIElementIsAttributeSettable(field,kAXSelectedTextRangeAttribute as CFString,&range),textCode=AXUIElementIsAttributeSettable(field,kAXSelectedTextAttribute as CFString,&textSettable)
+ guard rangeCode == .success,textCode == .success else{report["search_clear_failure"]="clear_capability_incomplete";return false}
+ let method:String
+ if range.boolValue,textSettable.boolValue {
+  // Submit through the already verified addressed text-edit path; visible
+  // AXValue and Cancel alone did not restore the model in the saved outcome.
+  searchModelNeedsProof=true
+  do {try submitQuery(root,"")} catch {report["search_clear_failure"]="clear_text_submission_failed";return false}
+  method="addressed_selected_text"
+ } else {
+  // Only a complete, positively unsupported capability permits the old
+  // cancel route. Never retry/fallback after an attempted text replacement.
+  guard !old.isEmpty else{report["search_clear_failure"]="clear_model_unverified";return false}
+  let known=["取消","Cancel","清除","Clear","清除搜索","Clear Search","取消搜索","Cancel Search","清空搜索"]
+  guard let matches=completeDiscovery({nodes(field,prune:false).filter{n in
+   text(n,kAXRoleAttribute)=="AXButton" && values([n]).contains{known.contains($0)}
+  }}),matches.count==1 else{report["search_clear_failure"]="clear_button_ambiguous";return false}
+  guard boundedClick(matches[0],root) else{report["search_clear_failure"]="clear_action_refused";return false}
+  method="addressed_cancel_button"
+ }
+ var witness=SearchPreparationWitness(stage:"clear_model",beforeCount:beforeCount,cachedRawCount:cached ?? -1)
+ let until=min(deadline,Date(timeIntervalSinceNow:4))
  while front(),Date()<until {
-  if let observed=completeDiscovery({()->Int? in
-   guard let (search,list)=context(root),text(search,kAXValueAttribute).isEmpty,
-    let rows=attr(list,kAXRowsAttribute) as? [AXUIElement] else{return nil}
-   return rows.count
-  }),let count=observed {
-   let cached=currentCategory=="deleted" ? deletedLabels?.count:activeLabels?.count
-   let evidence=completeDiscovery({categoryEvidence(root,currentCategory)})
-   let expected=cached ?? evidence?.1
-   report["search_clear_after_count"]=count
-   // The cancel action must restore the actual list model, not merely its
-   // visible field. A larger list (or known complete cached count) witnesses it.
-   if lastCount==count,(count>before.count || expected==count) {
-    boundQuery="";indexedLabels=nil;indexedCategory="";indexedQuery=""
-    report["search_clear_method"]="addressed_cancel_button";return true
-   }
-   lastCount=count
+  let frame=searchPreparationFrame(root,phase:"clear_model",query:"",category:currentCategory,withLabels:false,cachedRawCount:cached ?? -1,owner:{front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard})
+  if frame.complete {report["search_clear_after_count"]=frame.rawCount}
+  // Published item counts are diagnostic only: no guessed header offset or
+  // numerically coincident sidebar count authorizes a raw AXRows index.
+  if witness.observe(frame) {
+    boundQuery="";indexedLabels=nil;indexedCategory="";indexedQuery="";searchModelNeedsProof=false
+    report["search_clear_method"]=method;return true
   }
   pause(0.05)
  }
@@ -1228,40 +1349,35 @@ func submitQuery(_ root:AXUIElement,_ wanted:String)throws {
  boundQuery=wanted;indexedLabels=nil
 }
 func witnessedValueQuery(_ root:AXUIElement,_ wanted:String)throws->[[String]] {
- guard let (field,list)=context(root),let baselineRows=attr(list,kAXRowsAttribute) as? [AXUIElement],!baselineRows.isEmpty else{throw nativeFailure("search_baseline_unverified")}
+ guard let baseline=completeDiscovery({()->AXUIElement? in
+  guard let (field,list)=context(root),let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],!rows.isEmpty,categoryEvidence(root,currentCategory).0 else{return nil}
+  return field
+ }),let field=baseline else{throw nativeFailure("search_baseline_unverified")}
  var writable=DarwinBoolean(false)
  try require(AXUIElementIsAttributeSettable(field,kAXValueAttribute as CFString,&writable) == .success && writable.boolValue,"search_value_unsupported")
  let owner=NSWorkspace.shared.frontmostApplication?.processIdentifier,keyboard=focusPID()
  let sentinel="apw-no-result-"+UUID().uuidString.lowercased()
+ searchModelNeedsProof=true
  try require(set(field,kAXValueAttribute,sentinel as CFString),"search_value_refused")
  let emptyUntil=min(deadline,Date(timeIntervalSinceNow:3));var emptySeen=false
+ var emptyWitness=SearchPreparationWitness(stage:"empty_witness",beforeCount:-1,cachedRawCount:-1)
  while front(),Date()<emptyUntil {
-  if let (search,current)=context(root),text(search,kAXValueAttribute)==sentinel,
-   let rows=attr(current,kAXRowsAttribute) as? [AXUIElement],rows.isEmpty,!nativeObservationIncomplete {
-   pause(0.05)
-   if let (again,current)=context(root),text(again,kAXValueAttribute)==sentinel,
-    let rows=attr(current,kAXRowsAttribute) as? [AXUIElement],rows.isEmpty,!nativeObservationIncomplete {emptySeen=true;break}
-  }
-  pause(0.03)
+  let frame=searchPreparationFrame(root,phase:"empty_witness",query:sentinel,category:currentCategory,withLabels:false,cachedRawCount:-1,owner:{front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard})
+  if emptyWitness.observe(frame) {emptySeen=true;break}
+  pause(0.05)
  }
  try require(emptySeen,"search_empty_witness_unverified")
- guard let (current,_) = context(root) else{throw nativeFailure("search_context_changed")}
+ guard let observed=completeDiscovery({context(root)}),let (current,_) = observed else{throw nativeFailure("search_context_changed")}
  try require(set(current,kAXValueAttribute,wanted as CFString),"search_value_refused")
  let until=min(deadline,Date(timeIntervalSinceNow:4))
+ var targetWitness=SearchPreparationWitness(stage:"target_model",beforeCount:-1,cachedRawCount:-1)
  while front(),Date()<until {
-  if let (search,list)=context(root),text(search,kAXValueAttribute)==wanted,
-   let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=100,!rows.isEmpty,
-   let labels=completeDiscovery({rows.map{rowValues($0)}}),labels.contains(where:{$0.contains(wanted)}) {
-   pause(0.07)
-   if let (fresh,list)=context(root),text(fresh,kAXValueAttribute)==wanted,
-    let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=100,
-    let stable=completeDiscovery({rows.map{rowValues($0)}}),stable==labels,
-    acceptsSearchWitness(emptySeen:emptySeen,stableComplete:true,ownerUnchanged:NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard,count:stable.count) {
-    boundQuery=wanted;indexedLabels=stable
-    report["search_empty_witness_verified"]=true;return stable
-   }
+  let frame=searchPreparationFrame(root,phase:"target_model",query:wanted,category:currentCategory,withLabels:true,cachedRawCount:-1,owner:{front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard})
+  if targetWitness.observe(frame),acceptsSearchWitness(emptySeen:emptySeen,stableComplete:frame.complete,ownerUnchanged:frame.ownerUnchanged,count:frame.rawCount) {
+   boundQuery=wanted;indexedLabels=frame.labels
+   report["search_empty_witness_verified"]=true;return frame.labels
   }
-  pause(0.03)
+  pause(0.05)
  }
  // A zero target list could still be the sentinel model. Never call that
  // item_not_found: only a complete All index can prove absence in this case.
@@ -1284,8 +1400,10 @@ func selectCategory(_ root:AXUIElement,_ category:String,buildIndex:Bool=true)th
   try require(verified,"category_selection_unverified");currentCategory=category
  }
  if !buildIndex {return}
- guard let (currentSearch,_)=context(root) else{throw nativeFailure("locked_or_user_editor")}
- if requiresQueryClear(fullIndex:buildIndex,queryEmpty:text(currentSearch,kAXValueAttribute).isEmpty) {
+ guard context(root) != nil else{throw nativeFailure("locked_or_user_editor")}
+ // An empty visible field with a stale zero-result model is not All. The
+ // complete initial-model policy keeps normal fresh nonempty All lists usable.
+ if buildIndex {
   try require(clearSearchQuery(root),"list_preparation_failed");boundQuery=""
  }
  try require(context(root).map{text($0.0,kAXValueAttribute).isEmpty} ?? false,"filtered_list_refused")
@@ -1915,11 +2033,30 @@ func deletedNote(_ key:[String:String],_ expected:[String:Any])throws->[String:A
  var writable=DarwinBoolean(false)
  let selected=AXUIElementIsAttributeSettable(list,kAXSelectedRowsAttribute as CFString,&writable) == .success && writable.boolValue && set(list,kAXSelectedRowsAttribute,[row] as CFArray)
  try require(selected || set(row,kAXSelectedAttribute,kCFBooleanTrue),"select_unique_row_failed")
- let until=Date(timeIntervalSinceNow:5)
+ let until=min(deadline,Date(timeIntervalSinceNow:5))
+ var witness=DeletedNoteWitness(),framesObserved=0
+ let recoveryNames=["恢复密码","Recover Password","恢复","Recover","恢复备注","Recover Note","恢复密码…","Recover Password…"]
  while front(),Date()<until {
-  let view=nodes(root),vs=values(view)
-  let recovery=button(view,["恢复密码","Recover Password","恢复","Recover","恢复备注","Recover Note","恢复密码…","Recover Password…"])
-  if vs.contains(key["title"]!),vs.contains(expectedNote),recovery != nil,!nativeObservationIncomplete {
+  var selectedExact=false,titleMatches=false,noteMatches=false,recoveryUnique=false
+  let complete=completeDiscovery {()->Bool in
+   guard let (search,currentList)=context(root),let query=attr(search,kAXValueAttribute) as? String,query.isEmpty,
+    let currentRows=attr(currentList,kAXRowsAttribute) as? [AXUIElement],currentRows.count==labels.count else{return false}
+   var selectedValue:CFTypeRef?
+   let selectedCode=AXUIElementCopyAttributeValue(currentList,kAXSelectedRowsAttribute as CFString,&selectedValue)
+   observeNativeError(selectedCode,required:true)
+   if selectedCode == .success,let selectedRows=selectedValue as? [AXUIElement],selectedRows.count==1,
+    CFEqual(selectedRows[0],currentRows[indexes[0]]),rowValues(selectedRows[0])==labels[indexes[0]] {selectedExact=true}
+   let view=nodes(root),vs=values(view)
+   titleMatches=vs.contains(key["title"]!)
+   noteMatches=vs.contains{Array($0.utf16)==Array(expectedNote.utf16)}
+   recoveryUnique=view.filter{text($0,kAXRoleAttribute)=="AXButton" && values([$0]).contains{recoveryNames.contains($0)}}.count==1
+   return front() && categoryEvidence(root,"deleted").0
+  }==true
+  framesObserved=min(3000,framesObserved+1)
+  report["deleted_selected_exact"]=selectedExact;report["deleted_title_matches"]=titleMatches;report["deleted_note_matches"]=noteMatches
+  report["deleted_recovery_unique"]=recoveryUnique;report["deleted_frame_complete"]=complete;report["deleted_frames_observed"]=framesObserved
+  let frame=DeletedNoteFrame(selected_exact:selectedExact,title_matches:titleMatches,note_matches:noteMatches,recovery_unique:recoveryUnique,complete:complete)
+  if witness.observe(frame) {
    return ["ok":true,"state":expected,"verification":"deleted_note_identity_and_full_body"]
   }
   pause(0.05)
@@ -2136,7 +2273,7 @@ guard args==["--serve"] else {fputs("maintenance_invalid_entry_point\n",stderr);
 while let line=readLine(strippingNewline:true) {
  deadline=Date(timeIntervalSinceNow:90);nativeObservationIncomplete=false
  foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil
- for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {report[key]=nil}
+ for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {report[key]=nil}
  var response:[String:Any]=["ok":false,"app_activated":false,"backend":"apple-passwords-accessibility"]
  do {
   guard line.utf8.count<=4*1024*1024,let bytes=line.data(using:.utf8),let q=try JSONSerialization.jsonObject(with:bytes) as? [String:Any],let id=q["id"] as? Int else{throw nativeFailure("request_invalid")}
@@ -2148,7 +2285,7 @@ while let line=readLine(strippingNewline:true) {
   response["error"]=message.hasPrefix("maintenance_") && message.dropFirst(12).allSatisfy({$0.isLowercase || $0=="_"}) ? message:"maintenance_native_operation_failed"
   // Return only structural reasons. Never expose field values in diagnostics.
   var diagnostics:[String:Any]=[:]
-  for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {
+  for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {
    if let value=report[key] {diagnostics[key]=value}
   }
   response["diagnostics"]=diagnostics

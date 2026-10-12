@@ -31,7 +31,8 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
     search_witness_failure: ["maintenance_search_baseline_unverified", "maintenance_search_value_unsupported", "maintenance_search_value_refused",
       "maintenance_search_empty_witness_unverified", "maintenance_search_context_changed", "maintenance_search_target_model_unverified",
       "maintenance_search_observation_incomplete"],
-    search_clear_failure: ["clear_button_ambiguous", "clear_action_refused", "clear_model_unverified"],
+    search_clear_failure: ["clear_button_ambiguous", "clear_action_refused", "clear_model_unverified", "clear_capability_incomplete", "clear_text_submission_failed"],
+    search_clear_method: ["addressed_cancel_button", "addressed_selected_text"],
     bounded_click_bridge_failure: ["owner_changed", "process_changed", "window_changed", "sheet_changed", "role_changed", "identity_changed",
       "caption_changed", "none", "unclassified_system_events_error"],
     confirmation_bridge_failure: ["editor_address_unavailable", "owner_changed", "process_changed", "window_changed", "sheet_changed",
@@ -62,6 +63,11 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
   for (const name of ["confirmation_bridge_timed_out", "confirmation_account_list_enumerated"]) {
     if (typeof raw[name] === "boolean") out[name]=raw[name];
   }
+  for (const name of ["deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete"]) {
+    if (typeof raw[name] === "boolean") out[name]=raw[name];
+  }
+  const deletedFrames=raw.deleted_frames_observed;
+  if (typeof deletedFrames === "number" && Number.isInteger(deletedFrames) && deletedFrames>=0 && deletedFrames<=3000) out.deleted_frames_observed=deletedFrames;
   for (const name of ["synthetic_input_permission", "synthetic_input_selection_verified", "synthetic_input_postimage_verified",
     "synthetic_input_persisted_verified", "synthetic_input_editor_requires_review"]) {
     if (typeof raw[name] === "boolean") out[name]=raw[name];
@@ -110,6 +116,30 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
     }
     if (Object.keys(safe).length) out.native_incomplete_error_counts = safe;
   }
+  // Search model evidence contains only bounded, fixed structural fields.
+  // Reject the whole value when any nested key/type is outside that schema.
+  const integerBetween=(v:unknown,min:number,max:number):boolean =>
+    typeof v==="number" && Number.isInteger(v) && v>=min && v<=max;
+  const phases=["empty_witness","target_model","clear_model"];
+  const modelFrames=raw.search_model_frames;
+  if (Array.isArray(modelFrames) && modelFrames.length<=16 && modelFrames.every(frame=> {
+    if (!frame || typeof frame!=="object" || Array.isArray(frame)) return false;
+    const f=frame as Record<string,unknown>;
+    if (Object.keys(f).sort().join()!=="cached_raw_count,category_matches,complete,native_errors,owner_unchanged,phase,published_count,query_matches,raw_count" ||
+      typeof f.phase!=="string" || !phases.includes(f.phase) ||
+      ![f.complete,f.query_matches,f.category_matches,f.owner_unchanged].every(v=>typeof v==="boolean") ||
+      ![f.raw_count,f.published_count,f.cached_raw_count].every(v=>integerBetween(v,-1,3000)) ||
+      !Array.isArray(f.native_errors) || f.native_errors.length>8) return false;
+    return f.native_errors.every(error=> {
+      if (!error || typeof error!=="object" || Array.isArray(error)) return false;
+      const e=error as Record<string,unknown>;
+      return Object.keys(e).sort().join()==="code,count" && integerBetween(e.code,-100000000,100000000) && integerBetween(e.count,1,6000);
+    });
+  })) out.search_model_frames=modelFrames;
+  const frameCounts=raw.search_model_frame_counts;
+  if (frameCounts && typeof frameCounts==="object" && !Array.isArray(frameCounts) &&
+    Object.keys(frameCounts).sort().join()==="clear_model,empty_witness,target_model" &&
+    Object.values(frameCounts).every(v=>integerBetween(v,0,1024))) out.search_model_frame_counts=frameCounts;
   return out;
 }
 function canonical(v: unknown): string {

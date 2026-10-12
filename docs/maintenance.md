@@ -26,8 +26,11 @@ accepted only after a random query demonstrably empties the actual list and the
 target list is independently stable. The last fallback is one complete,
 unfiltered category index per helper session; a partial index is refused and
 not repeatedly rescanned. Filtered indexes are never reused as whole-library
-evidence. Recently Deleted is indexed separately. Search clearing addresses only
-the unique search-field Cancel button and verifies the actual list returned.
+evidence. Recently Deleted is indexed separately. Search clearing uses the addressed SelectedText path when it is independently
+supported, or a positively identified search-field Cancel button when it is not.
+It requires two complete observations of the restored list. An empty visible
+query with zero rows and a positive sidebar count is not an empty library; it
+stops before indexing or absence checks.
 
 Touch ID and app unlocking require the person. Locked/unsupported windows stop
 the command. `item doctor` reports actual local access/window availability;
@@ -41,7 +44,7 @@ exact reads and exposed an Apple editor behavior: AXValue updates the visible
 NotesField but does not persist its model. The replacement implementation uses
 complete AXSelectedText replacement with exact UTF-16 range and unchanged global
 focus checks. This new live write path and recoverable deletion still need a
-successful Apple synthetic trial; customer cleanup remains held. Exact bounded
+successful Apple synthetic trial; unattended batch cleanup is not accepted. Exact bounded
 search has succeeded live, but a subsequent read-only review found its text
 submission unavailable and stopped before mutation. Search capability is not
 reliably established. The advertised search Confirm action was also refused in a
@@ -264,3 +267,31 @@ deletion remain separate unfinished acceptance gates. See the
 
 Do not retire the source manager until field coverage, passkey identity,
 attachments and sharing/group checks all pass independently.
+
+## maintenance.6: incomplete-model and outcome protection
+
+Search polling now scopes completeness to each independent frame while preserving
+an outer incomplete observation. Two adjacent complete frames must agree on the
+query, category, owner, and actual list model. Clearing a query cannot reuse a
+zero-row model contradicted by the sidebar. A failed text submission cannot
+fall back to a second submission. Structural diagnostics contain bounded counts
+and Booleans, never queries, account labels or note contents.
+
+Recently Deleted verification independently binds one selected exact row, the
+full original body, its category and ordinary recovery control in two adjacent
+complete frames. A title match alone does not complete a deletion journal.
+
+In the latest live background run, exact candidate and keeper reads passed. One
+recoverable-delete attempt then returned an uncertain outcome. Read-only review
+found the exact candidate in Recently Deleted but could not verify its full body;
+the active list also remained a stale empty model. The journal remains uncertain,
+and no second delete was dispatched. The original snapshots and source manager
+remain preserved. This is an unfinished acceptance result, not successful bulk
+cleanup. Default background notes persistence also remains unverified.
+
+The initial build passed 19 suites / 1,126 checks. After the clear-query and deleted
+frame changes, the seven affected suites passed 406 checks through the compiled
+CLI/helper boundaries. Each saved report records its command. Pure frame replay
+and isolated transport tests prove refusal/recovery contracts; they do not prove
+Apple accepts the corresponding live action. See the
+[search failure specification](native-search-preparation-failure-spec.md).

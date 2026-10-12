@@ -50,6 +50,21 @@ SAFE = {
     "confirmation_native_editor_role": "AXGroup",
     "confirmation_account_list_enumerated": False,
     "confirmation_editor_path_depth": 3,
+    "search_model_frames": [
+        {"phase":"empty_witness","complete":False,"query_matches":True,"category_matches":True,"owner_unchanged":True,
+         "raw_count":2024,"published_count":2019,"cached_raw_count":-1,"native_errors":[{"code":-25202,"count":181}]},
+        {"phase":"clear_model","complete":True,"query_matches":True,"category_matches":True,"owner_unchanged":True,
+         "raw_count":2024,"published_count":2019,"cached_raw_count":2024,"native_errors":[]},
+    ],
+    "search_model_frame_counts": {"empty_witness":2,"target_model":0,"clear_model":2},
+    "deleted_selected_exact": True,
+    "deleted_title_matches": True,
+    "deleted_note_matches": False,
+    "deleted_recovery_unique": True,
+    "deleted_frame_complete": True,
+    "deleted_frames_observed": 2,
+    "search_clear_method": "addressed_selected_text",
+    "search_clear_failure": "clear_text_submission_failed",
 }
 SECRET = "APW_SYNTHETIC_DIAGNOSTIC_SECRET_20261012"
 
@@ -179,13 +194,52 @@ def main():
                 "confirmation_native_editor_role": SECRET,
                 "confirmation_account_list_enumerated": 0,
                 "confirmation_editor_path_depth": 17,
+                "search_model_frames": [{**SAFE["search_model_frames"][0],"notes":SECRET}],
+                "search_model_frame_counts": {"empty_witness":2,"target_model":0,"clear_model":2,"notes":SECRET},
+                "deleted_selected_exact": 1,
+                "deleted_title_matches": SECRET,
+                "deleted_note_matches": {"notes":SECRET},
+                "deleted_recovery_unique": "true",
+                "deleted_frame_complete": None,
+                "deleted_frames_observed": 3001,
+                "search_clear_method": SECRET,
+                "search_clear_failure": SECRET,
             }
             reply = run("malformed-allowed-keys", malformed)
             check("allowed diagnostic keys reject free text, containers and wrong scalar types", reply.get("diagnostics", {}) == {})
             reply = run("unavailable-status", {"status": "unavailable", "notes": SECRET})
             check("known unavailable context classification survives without free text", reply.get("diagnostics") == {"status": "unavailable"})
+
+            valid_frame = SAFE["search_model_frames"][0]
+            invalid_frames = [
+                SECRET, {"notes":SECRET}, [valid_frame]*17,
+                [{**valid_frame,"phase":SECRET}],
+                [{**valid_frame,"complete":1}],
+                [{**valid_frame,"raw_count":True}],
+                [{**valid_frame,"raw_count":3001}],
+                [{**valid_frame,"published_count":-2}],
+                [{**valid_frame,"cached_raw_count":0.5}],
+                [{**valid_frame,"native_errors":[{"code":-25202,"count":True}]}],
+                [{**valid_frame,"native_errors":[{"code":-25202,"count":6001}]}],
+                [{**valid_frame,"native_errors":[{"code":-25202,"count":1,"attribute":SECRET}]}],
+                [{**valid_frame,"native_errors":[{"code":SECRET,"count":1}]}],
+                [{**valid_frame,"native_errors":[{"code":-25202,"count":1}]*9}],
+            ]
+            for index, bad_frames in enumerate(invalid_frames):
+                reply=run("malformed-search-frames-"+str(index),{"search_model_frames":bad_frames})
+                check("malformed structural search frame "+str(index)+" is fully refused",reply.get("diagnostics",{})=={})
+            invalid_counts = [
+                {"empty_witness":True,"target_model":0,"clear_model":2},
+                {"empty_witness":1025,"target_model":0,"clear_model":2},
+                {"empty_witness":2,"target_model":-1,"clear_model":2},
+                {"empty_witness":2,"clear_model":2},
+                {"empty_witness":2,"target_model":0,"clear_model":SECRET},
+            ]
+            for index,bad_counts in enumerate(invalid_counts):
+                reply=run("malformed-search-frame-counts-"+str(index),{"search_model_frame_counts":bad_counts})
+                check("malformed search frame counts "+str(index)+" are refused",reply.get("diagnostics",{})=={})
             records = [json.loads(line) for line in calls.read_text().splitlines()]
-            check("one failing native read per invocation, without retry", records == [{"op": "read"}, {"op": "read"}, {"op": "read"}])
+            check("one failing native read per invocation, without retry", records == [{"op":"read"}]*(3+len(invalid_frames)+len(invalid_counts)))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
 

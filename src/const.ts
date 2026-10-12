@@ -1,5 +1,5 @@
 export const DATA_PATH = Deno.env.get("APW_DATA_DIR") ?? `${Deno.env.get("HOME")}/.apw`;
-export const VERSION = "1.1.1+maintenance.1";
+export const VERSION = "1.1.1+maintenance.4";
 export const SOCKET_PATH = `${DATA_PATH}/apw.sock`;
 export const EXTENSION_PATH = `${DATA_PATH}/extension`;
 export const BROWSER_PROFILE_PATH = `${DATA_PATH}/browser`;
@@ -7,10 +7,12 @@ export const CONFIG_PATH = `${DATA_PATH}/config.json`;
 
 export class APWError extends Error {
   public status: Status;
-  constructor(status: Status, message?: string) {
+  public diagnostics?: Record<string, unknown>;
+  constructor(status: Status, message?: string, diagnostics?: Record<string, unknown>) {
     const valid = typeof status === "number" && Object.hasOwn(StatusMap, status) ? status : Status.SERVER_ERROR;
     super(message || StatusMap[valid]);
     this.status = valid;
+    this.diagnostics = diagnostics;
   }
 }
 

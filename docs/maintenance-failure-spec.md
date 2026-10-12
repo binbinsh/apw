@@ -4,6 +4,13 @@ The real CLI is tested with an isolated synthetic native-helper process. That
 boundary test does not prove Apple's live UI supports an operation. A signed
 macOS helper performs live reads and mutations without activation or key events.
 
+Delete-confirmation diagnostics must survive both the native and CLI failure
+boundaries as fixed failure enums, integer exit/system codes, and a boolean
+timeout. Clear these fields at the start of each request so a later failure
+cannot inherit an earlier confirmation outcome. Free text, secret-bearing
+containers, boolean error codes, and string timeout values must be dropped.
+These diagnostics never authorize retrying a deletion.
+
 Fail closed when:
 - The plan is malformed, has duplicate operation IDs, has unsafe file permissions,
   or the journal belongs to another plan. No mutation happens in validation mode.
@@ -36,3 +43,8 @@ Readiness diagnostics must distinguish a locked window, an already open editor,
 an unsupported window and incomplete Accessibility observations. They may expose
 only structure, standard action names and attribute writability, never field
 values. An open user editor must not be cancelled to make a diagnostic succeed.
+
+Background connection may reopen Apple's signed application with activation
+disabled, but must preserve the foreground owner, never unlock on behalf of the
+person, never close an existing user window/editor, and verify an actual native
+window before returning success. A launch acknowledgement is not a live result.

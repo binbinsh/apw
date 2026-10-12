@@ -8,7 +8,8 @@ import type { PasswordEntry, Payload } from "./types.ts";
 import { ensureStarted } from "./startup.ts";
 import { exchangeStatus, launchExchangeDemo, launchOTPLoginDemo, prepareExchangeComponent } from "./exchange.ts";
 import { launchNotesImport, prepareNotes } from "./notes.ts";
-import { readItem, inspectItems, runBatch, maintenanceDoctor } from "./maintenance.ts";
+import { readItem, inspectItems, runBatch, maintenanceDoctor, maintenanceConnect, recoverEditor, probeNotesEditor } from "./maintenance.ts";
+import { capabilities } from "./capabilities.ts";
 
 const client = new ApplePasswordManager();
 
@@ -173,6 +174,15 @@ const batch = new Command().description("Recoverable, resumable maintenance batc
     .option("--output <path:string>", "New private snapshot file.", {required:true})
     .action(async (o:{targets:string;output:string}) => await inspectItems(o.targets,o.output)));
 const item = new Command().description("Exact native item/notes maintenance; never activates an app.")
+  .command("probe-notes", new Command().description("Read-only NotesField diagnosis on a hash-verified pre-existing synthetic fixture; never changes search or authorizes a mutation.")
+    .option("--snapshot <path:string>","Original private synthetic item snapshot.",{required:true})
+    .option("--foreground-focus","Explicit synthetic-only field-focus diagnosis; Passwords must already be foreground. Never activates it.")
+    .action(async (o:{snapshot:string;foregroundFocus?:boolean}) => await probeNotesEditor(o.snapshot,o.foregroundFocus === true)))
+  .command("recover-editor", new Command().description("Cancel a readonly editor only after two complete observations equal the original private snapshot; never changes field values or journals.")
+    .option("--snapshot <path:string>","Original private, hash-verified item snapshot.",{required:true})
+    .action(async (o:{snapshot:string}) => await recoverEditor(o.snapshot)))
+  .command("connect", new Command().description("Reopen Apple's signed Passwords window in the background; never unlock or activate it.")
+    .action(async () => await maintenanceConnect()))
   .command("doctor", new Command().description("Report native access/capabilities without opening or unlocking an app.")
     .action(async () => await maintenanceDoctor()))
   .command("read", new Command().description("Read one exact native item into a new private snapshot file.")
@@ -303,6 +313,8 @@ try {
     .name("apw")
     .version(`v${VERSION}`)
     .description("🔑 a CLI for Apple Passwords 🔒")
+    .command("capabilities", new Command().description("Report field/settings coverage and acceptance gaps offline; never opens an app or reads credentials.")
+      .action(() => console.log(JSON.stringify(capabilities()))))
     .command("auth", auth)
     .command("pw", pw)
     .command("item", item)
@@ -339,6 +351,7 @@ try {
         ? error.message
         : "operation_failed";
   }
-  console.error(JSON.stringify({ error: msg, status, results: [] }));
+  console.error(JSON.stringify({ error: msg, status, results: [],
+    ...(error instanceof APWError && error.diagnostics && Object.keys(error.diagnostics).length ? {diagnostics:error.diagnostics} : {}) }));
   Deno.exit(status);
 }

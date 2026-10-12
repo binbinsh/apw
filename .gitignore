@@ -15,3 +15,5 @@ apw-maintenance
 .DS_Store
 *.trial/
 *.jsonl
+__pycache__/
+*.pyc

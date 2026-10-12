@@ -1,7 +1,9 @@
 # Exact native maintenance (experimental)
 
 This GPL fork adds `item read`, `item notes set`, `item delete`, `batch inspect`,
-and `batch run`. The existing browser backend and pairing remain separate and
+`batch run`, `item connect`, `item recover-editor`, read-only `item probe-notes`,
+and offline `capabilities`.
+The existing browser backend and pairing remain separate and
 are not restarted by these commands.
 
 `batch run` validates only unless `--apply` is supplied. A batch contains at most
@@ -13,13 +15,19 @@ blind deletion, permanent deletion, or automatic mutation retry.
 Passwords has no public developer API for arbitrary whole-library notes editing
 or deletion. These new commands use a bundled Swift Accessibility backend,
 verified against Apple's signed Passwords process. They do not bypass unlocking,
-activate the application, set focus, or generate keyboard/mouse events. They may
+activate the application or generate keyboard/mouse events. Default commands
+do not set focus. The explicitly requested synthetic foreground probe described
+below has a separate, guarded internal field-focus operation. Commands may
 change the internal category, clear a search, select a record, open its editor,
 and dispatch its semantic Save/Delete actions in an already unlocked window.
-Active lookup replaces the search field's complete selected text and verifies
-the new query and at most 100 fresh result rows. No complete active-library scan
-is used. A fresh result model and selected row must match the bounded index; a
-mismatch fails closed. Recently Deleted is indexed separately.
+Active lookup first replaces the search field's complete selected text and
+verifies the query and at most 100 fresh result rows. If unsupported, AXValue is
+accepted only after a random query demonstrably empties the actual list and the
+target list is independently stable. The last fallback is one complete,
+unfiltered category index per helper session; a partial index is refused and
+not repeatedly rescanned. Filtered indexes are never reused as whole-library
+evidence. Recently Deleted is indexed separately. Search clearing addresses only
+the unique search-field Cancel button and verifies the actual list returned.
 
 Touch ID and app unlocking require the person. Locked/unsupported windows stop
 the command. `item doctor` reports actual local access/window availability;
@@ -33,13 +41,61 @@ exact reads and exposed an Apple editor behavior: AXValue updates the visible
 NotesField but does not persist its model. The replacement implementation uses
 complete AXSelectedText replacement with exact UTF-16 range and unchanged global
 focus checks. This new live write path and recoverable deletion still need a
-successful Apple synthetic trial; customer cleanup remains held. A later complete
-native index read was incomplete and stopped before a mutation. Bounded search
-now avoids that scan. The advertised search Confirm action was refused in a
-background trial; complete selected-text replacement still needs live acceptance.
+successful Apple synthetic trial; customer cleanup remains held. Exact bounded
+search has succeeded live, but a subsequent read-only review found its text
+submission unavailable and stopped before mutation. Search capability is not
+reliably established. The advertised search Confirm action was also refused in a
+background trial. In a separate self-owned SwiftUI fixture, successful AXValue
+and AXConfirm returned without updating the real Binding model. That experiment
+does not certify Apple operations.
 Readiness reports distinguish lock, editor, unsupported and incomplete views;
-static detail labels are not classified as editable fields. Do not treat mock
+static detail labels are not classified as editable fields. Each request obtains
+a fresh owner lease; transient invalid UI frames are discarded rather than
+poisoning a later complete observation. NotesField accepts the actually observed
+AXTextField as well as AXTextArea role; other fields cannot use the notes setter.
+Do not treat mock
 E2E or read-only diagnostics as an Apple mutation acceptance result.
+
+Notes capability checks require two fresh, complete, unchanged observations.
+Their raw attribute-query error codes distinguish transient failures from a
+stable unsupported field; no AXValue write fallback is used. The read-only
+diagnostic below avoids changing the search altogether:
+
+```sh
+apw item probe-notes --snapshot /private/directory/original-synthetic-snapshot.json
+```
+
+This command accepts only a private, hash-verified existing `apw API 测试`
+fixture with the synthetic marker, empty password and `.invalid` websites. It
+binds one unique match in the current stable result cohort, captures NotesField
+capabilities, descendants and target-app internal focus without secret values,
+then cancels and independently rechecks the full original state. Both Cancel
+operations must be verified. It does not change a query, field or journal. Its
+current-cohort evidence does not prove whole-library uniqueness and never
+authorizes a mutation. A failed or incomplete observation remains held.
+See the [probe failure specification](notes-editor-probe-failure-spec.md).
+An editor opened by a failed probe is recovered only when two complete
+observations exactly match the supplied preimage under its original lease.
+Otherwise the command reports `maintenance_editor_requires_review` and leaves
+the editor protected.
+
+One optional diagnostic checks whether NotesField capabilities change when the
+person has already brought Passwords to the foreground:
+
+```sh
+apw item probe-notes --snapshot /private/directory/original-synthetic-snapshot.json \
+  --foreground-focus
+```
+
+This mode requires Passwords to remain the existing foreground application; it
+never activates or raises it. After verifying the full original synthetic state,
+it may set `AXFocused` on the uniquely bound NotesField once. It verifies the
+target application's focused element and every original value before probing.
+It does not set search/note text, issue keyboard events, save, or delete. A known
+external keyboard owner, ambiguous field, failed focus proof, app switch, or
+incomplete state stops the diagnostic. Default background operations retain
+their original focus ban. A successful diagnostic is still not note-write
+acceptance.
 
 ## Build and repeatable tests
 
@@ -88,6 +144,19 @@ Targets format:
 Read captures a complete state and a canonical SHA-256. Title/account identifies
 a record only when exactly one native row matches; it is not a permanent Apple
 record ID. Ambiguous same-title/account duplicates are refused.
+
+An unchanged readonly editor left by an interrupted helper can be safely closed:
+
+```sh
+apw item recover-editor --snapshot /private/directory/original-snapshot.json
+```
+
+The original snapshot must be private and hash-verified. The native helper reads
+the complete editor state twice; both must exactly match the original. It only
+dispatches Cancel, never edits values or resets a mutation journal. An incomplete,
+changed or ambiguous editor remains protected. Live recovery of the existing
+synthetic SSO editor passed on 2026-10-12; this does not certify notes persistence
+or deletion.
 
 ## Plans and execution
 
@@ -140,8 +209,9 @@ mutation, completion only after exact readback. Interrupted/unknown operations
 resume read-only: the command verifies the expected after-state or stops for
 review. It never resends a write because a response was lost. Completed entries
 are reverified, not repeated. A dead executor's lock can be reclaimed only for
-the same plan. Notes-only deletion resume requires the captured native title to
-equal the displayed title; otherwise it stops for explicit review.
+the same plan. New intents retain the native title, so readonly deletion recovery
+can handle a native/list title difference. Legacy intents without that metadata
+still require reconstruction to match the original complete hash exactly.
 
 An operator can explicitly resolve a failed, unchanged operation with a read-only
 review. It checks the entire original state before permitting a later dispatch:

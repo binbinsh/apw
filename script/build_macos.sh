@@ -11,5 +11,12 @@ if [[ "${1:-}" == --verify ]]; then
   python3 tests/e2e_apw.py --bin "$PWD/dist/apw" --report "$PWD/reports/existing-cli.json"
   python3 tests/e2e_maintenance.py --bin "$PWD/dist/apw" --report "$PWD/reports/maintenance.json"
   python3 tests/e2e_native_contract.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-contract.json"
+  python3 tests/e2e_native_policy.py --helper "$PWD/dist/apw-maintenance" --report "$PWD/reports/native-policy.json"
+  python3 tests/e2e_capabilities.py --bin "$PWD/dist/apw" --report "$PWD/reports/capabilities.json"
+  python3 tests/e2e_native_diagnostics.py --bin "$PWD/dist/apw" --report "$PWD/reports/native-diagnostics.json"
+  python3 tests/e2e_delete_confirmation_diagnostics.py --bin "$PWD/dist/apw" --report "$PWD/reports/delete-confirmation-diagnostics.json"
+  python3 tests/e2e_editor_recovery.py --bin "$PWD/dist/apw" --report "$PWD/reports/editor-recovery.json"
+  python3 tests/e2e_notes_probe.py --bin "$PWD/dist/apw" --report "$PWD/reports/notes-probe.json"
+  python3 tests/e2e_batch_acceptance.py --bin "$PWD/dist/apw" --report "$PWD/reports/batch-acceptance.json"
 fi
 # No browser start/stop, app activation, real credential writes, or tool download.

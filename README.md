@@ -5,6 +5,19 @@
 > the synthetic CLI tests. Live Apple notes save/deletion has **not passed**;
 > do not apply maintenance plans to real credentials yet.
 > See [maintenance usage and limits](docs/maintenance.md).
+> Run `apw capabilities` for the offline field/settings coverage report; see
+> [capability and Apple acceptance gates](docs/capabilities.md). Native capability
+> flags and successful offline tests do not certify live Apple writes.
+> `item probe-notes` has passed a read-only Apple synthetic check without
+> changing the query or note: the observed NotesField exposes no writable
+> selected-text/range attributes or editable descendants. Its AXValue setter
+> has not persisted notes. This diagnostic result is not write acceptance.
+> An explicit `item probe-notes --foreground-focus` mode tests field capabilities
+> only when the person has already put Passwords in front. It does not activate
+> the app, write text, save or delete, and has not yet passed live acceptance.
+> [Browser protocol and REA evidence](docs/browser-protocol-evidence.md) records
+> the actual parsed fields and action dispatch; passkey and shared-group CRUD
+> are not implemented by the browser channel.
 
 <div align="center">
   <a href="https://github.com/bendews/apw">

@@ -2,12 +2,19 @@
 """Resume the saved two-fixture live trial; no new plan, exports or imports."""
 import argparse,json,pathlib,shlex,subprocess
 p=argparse.ArgumentParser();p.add_argument('--bin',required=True);p.add_argument('--trial',required=True);p.add_argument('--report',required=True);p.add_argument('--review-unchanged',action='store_true');a=p.parse_args()
-trial=pathlib.Path(a.trial);checks=[];commands=[];failure=None
+trial=pathlib.Path(a.trial);checks=[];commands=[];results=[];failure=None
 def check(name,ok):
     checks.append({'name':name,'passed':bool(ok)});assert ok,name
 def call(*args):
     cmd=[a.bin,*args];commands.append(shlex.join(cmd))
     r=subprocess.run(cmd,capture_output=True,text=True,timeout=110)
+    # These batch entry points emit only checkpoints and structural diagnostics.
+    # Preserve that evidence instead of losing the actual failure reason.
+    observations=[]
+    for line in (r.stdout+'\n'+r.stderr).splitlines():
+        try:observations.append(json.loads(line))
+        except json.JSONDecodeError:pass
+    results.append({'command':shlex.join(cmd),'exit_status':r.returncode,'observations':observations})
     if r.returncode: raise RuntimeError(json.loads(r.stderr.strip().splitlines()[-1]).get('error','command_failed'))
     return json.loads(r.stdout)
 try:
@@ -27,5 +34,5 @@ try:
     result=call('batch','run',*args,'--apply')
     check('completed live batch resumes without another write',result['completed']==2 and result['mutations']==0)
 except Exception as e: failure=type(e).__name__+': '+str(e)
-report={'passed':failure is None,'checks':checks,'error':failure,'command':shlex.join(['python3',str(pathlib.Path(__file__).resolve()),*__import__('sys').argv[1:]]),'entry_point_commands':commands,'boundary':'compiled CLI and actual Apple Passwords; saved synthetic trial only','exports':0,'imports':0,'app_activated':False,'real_customer_records_modified':0}
+report={'passed':failure is None,'checks':checks,'error':failure,'command':shlex.join(['python3',str(pathlib.Path(__file__).resolve()),*__import__('sys').argv[1:]]),'entry_point_commands':commands,'entry_point_results':results,'boundary':'compiled CLI and actual Apple Passwords; saved synthetic trial only','exports':0,'imports':0,'app_activated':False,'real_customer_records_modified':0}
 pathlib.Path(a.report).write_text(json.dumps(report,ensure_ascii=False,indent=2)+'\n');print(json.dumps({'passed':report['passed'],'checks':len(checks),'error':failure}));raise SystemExit(0 if report['passed'] else 1)

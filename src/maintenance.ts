@@ -8,9 +8,101 @@ type State = { key: Key; native_title: string; notes: string; password: string; 
   sharing: string; otp: string; passkey: string; extra_fields: unknown[] };
 type Operation = { id: string; kind: "notes-set" | "delete-redundant-note"; target: Key; before_sha256: string;
   notes?: string; keeper?: { target: Key; before_sha256: string }; preserve_text?: string; source_ids?: string[] };
-type Entry = { plan: string; id: string; event: string; after_sha256?: string; before_sha256?: string; at: string };
+type Entry = { plan: string; id: string; event: string; after_sha256?: string; before_sha256?: string; before_native_title?: string; at: string };
 const encoder = new TextEncoder();
 const fail = (code: string): never => { throw new APWError(Status.INVALID_PARAM, "maintenance_" + code); };
+// Backend diagnostics cross the public stderr boundary. Never forward arbitrary
+// native objects or free text, even when a field has a familiar name.
+function safeDiagnostics(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+  const raw = value as Record<string, unknown>, out: Record<string, unknown> = {};
+  const strings: Record<string, string[]> = {
+    failure_stage: ["initial_list_preparation", "search_context", "single_query_edit", "bounded_search", "unique_native_row",
+      "current_selection_list", "index_generation_changed", "index_identity_changed", "current_selection_identity",
+      "select_unique_row", "open_readonly_editor", "editor_open_unverified", "cancel_readonly_editor", "unknown"],
+    status: ["native_timeout_setup_failed", "native_access_unavailable", "passwords_foreground_required", "incomplete_window_observation",
+      "user_editor_open", "locked", "unsupported_window", "no_standard_window", "locked_or_access_unavailable"],
+    ui_set_attribute: ["AXValue", "AXSelected", "AXSelectedRows", "AXSelectedText", "AXSelectedTextRange"],
+    all_list_bridge_failure: ["owner_changed", "process_changed", "window_changed", "sheet_changed", "sidebar_changed", "category_changed",
+      "search_changed", "query_changed", "clear_changed", "none", "unclassified_system_events_error"],
+    request_owner_mode: ["foreground", "background", "refuse", "preserve"],
+    search_strategy: ["selected-text", "witnessed-value", "unfiltered-index"],
+    search_witness_failure: ["maintenance_search_baseline_unverified", "maintenance_search_value_unsupported", "maintenance_search_value_refused",
+      "maintenance_search_empty_witness_unverified", "maintenance_search_context_changed", "maintenance_search_target_model_unverified",
+      "maintenance_search_observation_incomplete"],
+    search_clear_failure: ["clear_button_ambiguous", "clear_action_refused", "clear_model_unverified"],
+    bounded_click_bridge_failure: ["owner_changed", "process_changed", "window_changed", "sheet_changed", "role_changed", "identity_changed",
+      "caption_changed", "none", "unclassified_system_events_error"],
+    confirmation_bridge_failure: ["editor_address_unavailable", "owner_changed", "process_changed", "window_changed", "sheet_changed",
+      "fields_ambiguous", "identity_changed", "credential_changed", "editor_address_changed", "ordinary_confirmation_unavailable", "none", "unclassified_system_events_error"],
+    confirmation_native_editor_role: ["AXGroup", "AXScrollArea", "AXSplitGroup"],
+    search_phase: ["selected_text_value_wait", "category_confirmation", "bounded_model_wait"],
+    search_wait_end: ["fresh_target_value_verified", "fresh_target_value_timeout", "category_verified", "category_unverified",
+      "bounded_exact_model_verified", "bounded_target_missing_using_complete_index"],
+    notes_role: ["AXTextField", "AXTextArea"],
+    notes_observation_end: ["two_complete_writable_frames", "stable_unsupported", "transient_or_incomplete_timeout", "editable_fields_changed"],
+    notes_probe_stage: ["input_validation", "initial_cohort", "initial_read", "initial_state", "notes_capabilities", "notes_structure",
+      "first_cancel", "preservation_cohort", "preservation_read", "preservation_state", "final_cancel", "complete", "foreground_owner", "notes_focus"],
+  };
+  for (const [name, allowed] of Object.entries(strings)) if (typeof raw[name] === "string" && allowed.includes(raw[name] as string)) out[name] = raw[name];
+  for (const name of ["ui_set_error_code", "ui_press_error_code", "all_list_bridge_stage", "all_list_bridge_error_code", "all_list_bridge_exit_code",
+    "bounded_click_bridge_error_code", "bounded_click_bridge_exit_code", "confirmation_bridge_system_error_code"]) {
+    const v = raw[name]; if (typeof v === "number" && Number.isInteger(v) && Math.abs(v) <= 100000000) out[name] = v;
+  }
+  for (const name of ["notes_range_code", "notes_text_code", "notes_value_code", "notes_actions_code", "focus_set_code"]) {
+    const v=raw[name]; if (typeof v === "number" && Number.isInteger(v) && Math.abs(v)<=100000000) out[name]=v;
+  }
+  for (const name of ["notes_range_settable", "notes_text_settable", "notes_value_settable", "notes_probe_read_opened", "notes_probe_recovery_attempted",
+    "notes_probe_editor_recovered", "notes_probe_editor_requires_review", "focus_requested", "focus_settable", "focus_verified"]) {
+    if (typeof raw[name] === "boolean") out[name]=raw[name];
+  }
+  for (const name of ["confirmation_bridge_timed_out", "confirmation_account_list_enumerated"]) {
+    if (typeof raw[name] === "boolean") out[name]=raw[name];
+  }
+  for (const [name,max] of [["confirmation_bridge_exit_code",255],["confirmation_editor_path_depth",16]] as const) {
+    const v=raw[name]; if (typeof v === "number" && Number.isInteger(v) && v>=0 && v<=max) out[name]=v;
+  }
+  const noteActions = raw.notes_action_names;
+  const allowedActions = ["AXPress", "AXIncrement", "AXDecrement", "AXConfirm", "AXCancel", "AXShowMenu", "AXPick", "AXRaise",
+    "AXScrollToVisible", "AXShowAlternateUI", "AXShowDefaultUI"];
+  if (Array.isArray(noteActions) && noteActions.length <= allowedActions.length &&
+      noteActions.every(x => typeof x === "string" && allowedActions.includes(x))) out.notes_action_names = noteActions;
+  const noteFrames = raw.notes_observation_frames;
+  if (typeof noteFrames === "number" && Number.isInteger(noteFrames) && noteFrames >= 0 && noteFrames <= 3000) out.notes_observation_frames = noteFrames;
+  const probeRows = raw.notes_probe_row_count;
+  if (typeof probeRows === "number" && Number.isInteger(probeRows) && probeRows >= 1 && probeRows <= 100) out.notes_probe_row_count = probeRows;
+  const roles = ["other", "AXTextField", "AXTextArea", "AXComboBox", "AXStaticText", "AXGroup", "AXScrollArea", "AXButton", "AXImage",
+    "AXLink", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXOutline", "AXTable", "AXRow", "AXToolbar", "AXWindow", "AXApplication"];
+  const children = raw.notes_children as Record<string, unknown> | undefined;
+  if (children && typeof children === "object" && !Array.isArray(children) && Number.isInteger(children.count) &&
+      typeof children.count === "number" && children.count >= 0 && children.count <= 16 && typeof children.complete === "boolean" &&
+      Array.isArray(children.nodes) && children.nodes.length === children.count && children.nodes.every(node => {
+        if (!node || typeof node !== "object" || Array.isArray(node)) return false;
+        const n = node as Record<string, unknown>;
+        return Object.keys(n).sort().join() === "depth,editable_role,identifier_present,parent_bound,role,same_pid" &&
+          typeof n.role === "string" && roles.includes(n.role) && typeof n.depth === "number" && Number.isInteger(n.depth) && n.depth >= 1 && n.depth <= 4 &&
+          [n.identifier_present,n.same_pid,n.parent_bound,n.editable_role].every(x => typeof x === "boolean");
+      })) out.notes_children = {count:children.count,complete:children.complete,nodes:children.nodes};
+  const focus = raw.notes_internal_focus as Record<string,unknown> | undefined;
+  if (focus && typeof focus === "object" && !Array.isArray(focus) &&
+      Object.keys(focus).sort().join() === "code,known_role,matches_notes,same_pid" &&
+      typeof focus.code === "number" && Number.isInteger(focus.code) && Math.abs(focus.code) <= 100000000 &&
+      typeof focus.same_pid === "boolean" && typeof focus.matches_notes === "boolean" &&
+      typeof focus.known_role === "string" && [...roles,"none"].includes(focus.known_role)) out.notes_internal_focus = focus;
+  if (typeof raw.all_list_bridge_timed_out === "boolean") out.all_list_bridge_timed_out = raw.all_list_bridge_timed_out;
+  for (const name of ["search_clear_before_count", "search_clear_after_count", "search_result_count"]) {
+    const v=raw[name]; if (typeof v === "number" && Number.isInteger(v) && v>=0 && v<=3000) out[name]=v;
+  }
+  const counts = raw.native_incomplete_error_counts;
+  if (counts && typeof counts === "object" && !Array.isArray(counts)) {
+    const safe: Record<string, number> = {};
+    for (const [code, count] of Object.entries(counts)) {
+      if (/^-252\d{2}$/.test(code) && typeof count === "number" && Number.isInteger(count) && count > 0 && count <= 1000000) safe[code] = count;
+    }
+    if (Object.keys(safe).length) out.native_incomplete_error_counts = safe;
+  }
+  return out;
+}
 function canonical(v: unknown): string {
   if (Array.isArray(v)) return "[" + v.map(canonical).join(",") + "]";
   if (v && typeof v === "object") return "{" + Object.entries(v).sort(([a], [b]) => a.localeCompare(b, "en")).map(([k, x]) => JSON.stringify(k) + ":" + canonical(x)).join(",") + "}";
@@ -79,7 +171,10 @@ class Native {
       const n = this.buffer.indexOf("\n"), line = this.buffer.slice(0, n); this.buffer = this.buffer.slice(n + 1);
       let r: Record<string, unknown>; try { r = JSON.parse(line); } catch { fail("helper_reply_invalid"); }
       if (r!.id !== id || r!.app_activated !== false || typeof r!.ok !== "boolean") fail("helper_reply_invalid");
-      if (!r!.ok) fail(typeof r!.error === "string" && /^maintenance_[a-z_]+$/.test(r!.error) ? r!.error.slice(12) : "native_operation_failed");
+      if (!r!.ok) {
+        const code = typeof r!.error === "string" && /^maintenance_[a-z_]+$/.test(r!.error) ? r!.error : "maintenance_native_operation_failed";
+        throw new APWError(Status.INVALID_PARAM, code, safeDiagnostics(r!.diagnostics));
+      }
       return r!;
     };
     try {
@@ -146,6 +241,47 @@ async function absolute(path: string): Promise<string> {
 export async function maintenanceDoctor(): Promise<void> {
   const native = new Native(); try { console.log(JSON.stringify(await native.call("doctor"))); } finally { await native.close(); }
 }
+export async function maintenanceConnect(): Promise<void> {
+  const native = new Native(); try { console.log(JSON.stringify(await native.call("connect"))); } finally { await native.close(); }
+}
+export async function recoverEditor(snapshotPath: string): Promise<void> {
+  let raw: {format?: string; sha256?: string; state?: State};
+  try { raw = JSON.parse(new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(snapshotPath))); }
+  catch { fail("recovery_snapshot_invalid"); }
+  if (raw!.format !== "apw-item-snapshot-v1" || !raw!.state || !key(raw!.state.key)) fail("recovery_snapshot_invalid");
+  const expected = state(raw!.state,raw!.state!.key);
+  if (raw!.sha256 !== await hash(expected)) fail("recovery_snapshot_invalid");
+  const native = new Native();
+  try {
+    const result = await native.call("recover-readonly-editor", {expected});
+    if (result.recovered !== true || result.credentials_changed !== 0 || result.journal_modified !== false) fail("editor_recovery_unverified");
+    console.log(JSON.stringify({recovered:true,credentials_changed:0,journal_modified:false,app_activated:false}));
+  } finally {await native.close();}
+}
+export async function probeNotesEditor(snapshotPath: string, foregroundFocus = false): Promise<void> {
+  let raw: {format?: string; sha256?: string; state?: State} | null;
+  try {raw = JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(await privateBytes(snapshotPath)));}
+  catch {fail("probe_snapshot_invalid");}
+  if (!raw! || raw!.format !== "apw-item-snapshot-v1" || !raw!.state || !key(raw!.state.key)) fail("probe_snapshot_invalid");
+  const expected = state(raw!.state,raw!.state!.key);
+  if (raw!.sha256 !== await hash(expected)) fail("probe_snapshot_invalid");
+  const syntheticSite = (site:string):boolean => {
+    try {return new URL(site.includes("://") ? site : "https://"+site).hostname.endsWith(".invalid");} catch {return false;}
+  };
+  if (!expected.key.title.startsWith("apw API 测试") || expected.native_title !== expected.key.title ||
+      !expected.notes.includes("APW_EXCHANGE_SYNTHETIC_V1") || expected.password !== "" ||
+      (expected.key.username !== "" && !expected.key.username.endsWith(".invalid")) ||
+      !expected.sites.every(syntheticSite) || expected.sharing !== "unshared" || expected.extra_fields.length !== 0) fail("probe_synthetic_required");
+  const native = new Native();
+  try {
+    const result = await native.call("notes-editor-probe",{expected,key:expected.key,synthetic_only:true,foreground_focus:foregroundFocus});
+    if (result.probed !== true || result.synthetic_only !== true || result.mutation_authorized !== false ||
+        result.current_cohort_only !== true || result.credentials_changed !== 0 || result.journal_modified !== false ||
+        result.foreground_focus !== foregroundFocus) fail("probe_completion_unverified");
+    console.log(JSON.stringify({probed:true,synthetic_only:true,mutation_authorized:false,current_cohort_only:true,
+      credentials_changed:0,journal_modified:false,app_activated:false,foreground_focus:foregroundFocus,diagnostics:safeDiagnostics(result.diagnostics)}));
+  } finally {await native.close();}
+}
 export async function runBatch(planPath: string, journalPath: string, apply: boolean, onlyKind?: Operation["kind"], review=false): Promise<void> {
   const bytes = await privateBytes(planPath);
   let raw: unknown; try { raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { fail("plan_invalid"); }
@@ -186,9 +322,10 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
     }
     const opened = await file!.stat(), pathNow = await Deno.lstat(journalPath);
     if (!opened.isFile || opened.uid !== Deno.uid() || (opened.mode! & 0o077) || pathNow.isSymlink || pathNow.ino !== opened.ino) fail("journal_unsafe");
-    const append = async (o: Operation, event: string, after?: string) => {
+    const append = async (o: Operation, event: string, after?: string, beforeNativeTitle?: string) => {
       const entry: Entry = { plan: planHash, id: o.id, event, before_sha256: o.before_sha256,
-        ...(after ? { after_sha256: after } : {}), at: new Date().toISOString() };
+        ...(after ? { after_sha256: after } : {}),
+        ...(event === "intent" && beforeNativeTitle !== undefined ? { before_native_title: beforeNativeTitle } : {}), at: new Date().toISOString() };
       await writeAll(file!, encoder.encode(JSON.stringify(entry) + "\n")); history.push(entry);
     };
     native = new Native();
@@ -210,7 +347,9 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
         } else {
           // Deleted notes cannot be edited. Bind placement/body verification to
           // the original empty-credential note snapshot, never infer empty data.
-          const deletedBefore: State = { key: o.target, native_title: o.target.title, notes: o.preserve_text!, password: "",
+          const capturedTitle = prior.findLast(x => x.event === "intent")?.before_native_title;
+          if (capturedTitle !== undefined && (typeof capturedTitle !== "string" || capturedTitle.includes("\0"))) fail("outcome_requires_review");
+          const deletedBefore: State = { key: o.target, native_title: capturedTitle === undefined ? o.target.title : capturedTitle, notes: o.preserve_text!, password: "",
             sites: [], sharing: "unshared", otp: "absent", passkey: "absent", extra_fields: [] };
           if (await hash(deletedBefore) !== o.before_sha256) fail("outcome_requires_review");
           let active = false;
@@ -235,7 +374,7 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
           o.source_ids!.some(x => !keeper.notes.includes(x))) fail("keeper_proof_refused");
       }
       const afterHash = intended ? await hash(intended) : undefined;
-      await append(o, "intent", afterHash); // fsync precedes any mutation
+      await append(o, "intent", afterHash, before.native_title); // fsync precedes any mutation
       try {
         const result = await native.call(o.kind, { key: o.target, expected: before, ...(intended ? { notes: intended.notes } : {}) });
         mutations++;

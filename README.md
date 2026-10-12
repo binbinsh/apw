@@ -1,3 +1,31 @@
+> **Experimental GPL maintenance fork:** maintained at [gridheap/apw](https://github.com/gridheap/apw),
+> based on [bendews/apw](https://github.com/bendews/apw). `codex/batch-maintenance` implements native notes editing,
+> recoverable redundant-note deletion, targeted batch inspection, and journaled
+> execution/resume. These functions use a macOS Accessibility helper; they do not
+> provide a public whole-vault Apple API. Live write verification is separate from
+> the synthetic CLI tests. Live Apple notes save/deletion has **not passed**;
+> do not apply maintenance plans to real credentials yet.
+> See [maintenance usage and limits](docs/maintenance.md).
+> Run `apw capabilities` for the offline field/settings coverage report; see
+> [capability and Apple acceptance gates](docs/capabilities.md). Native capability
+> flags and successful offline tests do not certify live Apple writes.
+> `item probe-notes` has passed a read-only Apple synthetic check without
+> changing the query or note: the observed NotesField exposes no writable
+> selected-text/range attributes or editable descendants. Its AXValue setter
+> has not persisted notes. This diagnostic result is not write acceptance.
+> An explicit `item probe-notes --foreground-focus` mode tests field capabilities
+> only when the person has already put Passwords in front. It does not activate
+> the app, write text, save or delete, and has not yet passed live acceptance.
+> `item test-notes-input --foreground-synthetic` is a separate one-shot experiment
+> for two exact pre-existing synthetic fixtures. It requires a private original
+> snapshot, append-only test notes and a new fsynced journal. Its PID-addressed
+> input is unavailable to ordinary maintenance commands. A self-owned SwiftUI
+> fixture passed Binding/persisted-readback tests; Apple persistence remains
+> unverified. See [the native experiment contract](docs/native-synthetic-notes-input-failure-spec.md).
+> [Browser protocol and REA evidence](docs/browser-protocol-evidence.md) records
+> the actual parsed fields and action dispatch; passkey and shared-group CRUD
+> are not implemented by the browser channel.
+
 <div align="center">
   <a href="https://github.com/bendews/apw">
     <img src="icon.png" alt="Logo" width="80" height="80">
@@ -20,7 +48,7 @@
 
 [![Contributors][contributors-shield]][contributors-url] [![Forks][forks-shield]][forks-url]
 [![Stargazers][stars-shield]][stars-url] [![Issues][issues-shield]][issues-url]
-[![MIT License][license-shield]][license-url]
+[![GPL License][license-shield]][license-url]
 <br />
 
 </div>
@@ -191,5 +219,5 @@ Distributed under the GPL V3.0 License. See `LICENSE` for more information.
 [issues-shield]: https://img.shields.io/github/issues/bendews/apw.svg?style=for-the-badge
 [issues-url]: https://github.com/bendews/apw/issues
 [license-shield]: https://img.shields.io/github/license/bendews/apw.svg?style=for-the-badge
-[license-url]: https://github.com/bendews/apw/blob/master/LICENSE.txt
+[license-url]: https://github.com/gridheap/apw/blob/codex/batch-maintenance/LICENSE
 [product-screenshot]: images/screenshot.png

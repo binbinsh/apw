@@ -1,4 +1,5 @@
 import { CONFIG_PATH } from "./const.ts";
+import { validatePaths } from "./private.ts";
 
 export interface Config {
   browser?: string;
@@ -15,5 +16,7 @@ export function readConfig(): Config {
 }
 
 export function writeConfig(patch: Partial<Config>): void {
+  validatePaths(true);
   Deno.writeTextFileSync(CONFIG_PATH, JSON.stringify({ ...readConfig(), ...patch }, null, 2));
+  Deno.chmodSync(CONFIG_PATH, 0o600);
 }

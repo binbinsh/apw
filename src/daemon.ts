@@ -1,6 +1,7 @@
 import { APWError, DATA_PATH, SOCKET_PATH, Status } from "./const.ts";
 import { type Browser, launchBrowser } from "./browser.ts";
 import type { APWResponse, Message } from "./types.ts";
+import { validatePaths, writeAll } from "./private.ts";
 
 const REQUEST_TIMEOUT_MS = 30_000;
 
@@ -19,6 +20,9 @@ class ExtensionSession {
   private chain: Promise<unknown> = Promise.resolve();
 
   constructor(private token: string) {}
+  get ready(): boolean {
+    return this.ws?.readyState === WebSocket.OPEN;
+  }
 
   private rejectPending(error: Error): void {
     if (!this.pending) return;
@@ -51,7 +55,7 @@ class ExtensionSession {
         return;
       }
 
-      if (!("token" in message) && this.pending?.id === message.id) {
+      if (!("token" in message) && this.pending && this.pending.id === message.id) {
         const pending = this.pending;
         this.pending = null;
         clearTimeout(pending.timer);
@@ -60,6 +64,7 @@ class ExtensionSession {
     });
 
     ws.addEventListener("close", () => {
+      if (this.ws !== ws) return;
       this.ws = null;
       this.rejectPending(new Error("Extension disconnected"));
       console.info("[apw] extension disconnected");
@@ -87,7 +92,8 @@ class ExtensionSession {
 
 async function handleCliConnection(
   conn: Deno.Conn,
-  session: { request(message: Message): Promise<APWResponse> },
+  session: ExtensionSession,
+  details: { browser: Browser; pid: number; stop(): void },
 ): Promise<void> {
   const decoder = new TextDecoder();
   const encoder = new TextEncoder();
@@ -95,7 +101,7 @@ async function handleCliConnection(
   let text = "";
   const send = async (response: APWResponse) => {
     try {
-      await conn.write(encoder.encode(`${JSON.stringify(response)}\n`));
+      await writeAll(conn, encoder.encode(`${JSON.stringify(response)}\n`));
     } catch (e) {
       if ((e as { code?: string }).code !== "EPIPE") throw e;
     }
@@ -107,7 +113,7 @@ async function handleCliConnection(
       while (!text.includes("\n")) {
         const n = await conn.read(buf);
         if (n === null) break;
-        text += decoder.decode(buf.subarray(0, n));
+        text += decoder.decode(buf.subarray(0, n), { stream: true });
         if (text.length > 1024 * 1024) break;
       }
     } finally {
@@ -116,6 +122,31 @@ async function handleCliConnection(
 
     try {
       const message = JSON.parse(text.split("\n", 1)[0]) as Message;
+      if ("op" in message && message.op === "status") {
+        const state = session.ready ? await session.request({ op: "status" }) : null;
+        const data: Record<string, unknown> = state && "data" in state ? state.data : {};
+        await send({
+          id: "",
+          data: {
+            STATUS: 0,
+            running: true,
+            bridge: session.ready,
+            paired: data.paired === true,
+            native_channel_ready: data.paired === true && data.native_channel_ready !== false,
+            ...(data.native_reply_correlation ? { native_reply_correlation: data.native_reply_correlation } : {}),
+            browser: details.browser.name,
+            browser_pid: details.pid,
+            daemon_pid: Deno.pid,
+          },
+        });
+        return;
+      }
+      if ("op" in message && message.op === "stop") {
+        await send({ id: "", data: { STATUS: 0, stopping: true } });
+        setTimeout(details.stop, 20);
+        return;
+      }
+      if (!("cmd" in message)) throw new APWError(Status.INVALID_PARAM);
       if (typeof message.cmd !== "number") {
         throw new APWError(Status.INVALID_PARAM);
       }
@@ -125,51 +156,118 @@ async function handleCliConnection(
       await send({
         id: "",
         status: err instanceof APWError ? err.status : Status.SERVER_ERROR,
-        error: err.message,
+        error: "request_failed",
       });
     }
   } finally {
-    conn.close();
+    try {
+      conn.close();
+    } catch { /* timeout */ }
   }
 }
 
 export async function daemon(browser: Browser): Promise<void> {
-  Deno.mkdirSync(DATA_PATH, { recursive: true, mode: 0o700 });
-  Deno.chmodSync(DATA_PATH, 0o700);
-
-  const token = crypto.randomUUID();
-  const session = new ExtensionSession(token);
-
-  const wsServer = Deno.serve({ hostname: "127.0.0.1", port: 0 }, (req) => {
-    if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
-      return new Response("WebSocket upgrade required", { status: 426 });
-    }
-    const { socket, response } = Deno.upgradeWebSocket(req);
-    session.accept(socket);
-    return response;
-  });
-
-  const child = await launchBrowser(browser, { port: (wsServer.addr as Deno.NetAddr).port, token });
-  console.info(`[apw] launched headless ${browser.name}; extension loaded.`);
-  const shutdown = async () => {
+  validatePaths(true);
+  const lockPath = `${DATA_PATH}/daemon.lock`;
+  const lockToken = crypto.randomUUID();
+  function acquire(): void {
     try {
-      child.kill("SIGTERM");
-      await child.status;
-    } catch { /* ignore */ }
-    Deno.exit(0);
-  };
-  for (const signal of ["SIGINT", "SIGTERM"] as const) Deno.addSignalListener(signal, shutdown);
-
-  try {
-    Deno.removeSync(SOCKET_PATH);
-  } catch (error) {
-    if (!(error instanceof Deno.errors.NotFound)) throw error;
+      const file = Deno.openSync(lockPath, { createNew: true, write: true, mode: 0o600 });
+      try {
+        file.writeSync(new TextEncoder().encode(JSON.stringify({ pid: Deno.pid, token: lockToken })));
+      } finally {
+        file.close();
+      }
+    } catch (e) {
+      if (!(e instanceof Deno.errors.AlreadyExists)) throw e;
+      try {
+        const existing = JSON.parse(Deno.readTextFileSync(lockPath));
+        Deno.kill(existing.pid, 0);
+      } catch (probe) {
+        if (probe instanceof Deno.errors.NotFound) {
+          Deno.removeSync(lockPath);
+          acquire();
+          return;
+        }
+      }
+      throw new APWError(Status.INVALID_SESSION, "apple_daemon_already_running");
+    }
   }
-  const unixListener = Deno.listen({ transport: "unix", path: SOCKET_PATH });
-  console.info(`[apw] Unix socket at ${SOCKET_PATH}`);
-  await Deno.chmod(SOCKET_PATH, 0o600);
-
-  for await (const conn of unixListener) {
-    handleCliConnection(conn, session).catch(console.error);
+  acquire();
+  let child: Deno.ChildProcess | undefined;
+  let listener: Deno.Listener | undefined;
+  let server: Deno.HttpServer | undefined;
+  let closing = false;
+  let stopped: Promise<void> | undefined;
+  const shutdown = (): void => {
+    if (closing) return;
+    closing = true;
+    stopped = (async () => {
+      try {
+        listener?.close();
+      } catch { /* closed */ }
+      if (child) {
+        try {
+          child.kill("SIGTERM");
+        } catch { /* gone */ }
+        const timer = setTimeout(() => {
+          try {
+            child!.kill("SIGKILL");
+          } catch { /* gone */ }
+        }, 5000);
+        await child.status.catch(() => {});
+        clearTimeout(timer);
+      }
+      if (server) await server.shutdown().catch(() => {});
+    })();
+  };
+  try {
+    const token = crypto.randomUUID();
+    const session = new ExtensionSession(token);
+    server = Deno.serve({ hostname: "127.0.0.1", port: 0 }, (req) => {
+      if (req.headers.get("upgrade")?.toLowerCase() !== "websocket") {
+        return new Response("WebSocket upgrade required", { status: 426 });
+      }
+      const { socket, response } = Deno.upgradeWebSocket(req);
+      session.accept(socket);
+      return response;
+    });
+    child = await launchBrowser(browser, { port: (server.addr as Deno.NetAddr).port, token });
+    // A lost browser also loses Apple's pairing. Release the owned daemon state
+    // so a later auth can start a fresh bridge instead of waiting on a stale one.
+    void child.status.then(shutdown, shutdown);
+    console.info(`[apw] launched isolated headless ${browser.name}; extension loaded.`);
+    for (const signal of ["SIGINT", "SIGTERM"] as const) Deno.addSignalListener(signal, shutdown);
+    try {
+      Deno.removeSync(SOCKET_PATH);
+    } catch (e) {
+      if (!(e instanceof Deno.errors.NotFound)) throw e;
+    }
+    listener = Deno.listen({ transport: "unix", path: SOCKET_PATH });
+    Deno.chmodSync(SOCKET_PATH, 0o600);
+    console.info(`[apw] Unix socket ready.`);
+    try {
+      for await (const conn of listener) {
+        handleCliConnection(conn, session, { browser, pid: child.pid, stop: shutdown }).catch(() => {});
+      }
+    } catch (e) {
+      if (!closing) throw e;
+    }
+    await stopped;
+  } finally {
+    shutdown();
+    await stopped;
+    for (const signal of ["SIGINT", "SIGTERM"] as const) {
+      try {
+        Deno.removeSignalListener(signal, shutdown);
+      } catch { /* startup failure */ }
+    }
+    try {
+      Deno.removeSync(SOCKET_PATH);
+    } catch { /* absent */ }
+    try {
+      const existing = JSON.parse(Deno.readTextFileSync(lockPath));
+      if (existing.token === lockToken) Deno.removeSync(lockPath);
+    } catch { /* absent */ }
   }
 }

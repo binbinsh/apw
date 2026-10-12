@@ -8,7 +8,8 @@ type State = { key: Key; native_title: string; notes: string; password: string; 
   sharing: string; otp: string; passkey: string; extra_fields: unknown[] };
 type Operation = { id: string; kind: "notes-set" | "delete-redundant-note"; target: Key; before_sha256: string;
   notes?: string; keeper?: { target: Key; before_sha256: string }; preserve_text?: string; source_ids?: string[] };
-type Entry = { plan: string; id: string; event: string; after_sha256?: string; before_sha256?: string; before_native_title?: string; at: string };
+type Entry = { plan: string; id: string; event: string; after_sha256?: string; before_sha256?: string; before_native_title?: string;
+  before_snapshot_path?: string; at: string };
 const encoder = new TextEncoder();
 const fail = (code: string): never => { throw new APWError(Status.INVALID_PARAM, "maintenance_" + code); };
 // Backend diagnostics cross the public stderr boundary. Never forward arbitrary
@@ -21,7 +22,7 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
       "current_selection_list", "index_generation_changed", "index_identity_changed", "current_selection_identity",
       "select_unique_row", "open_readonly_editor", "editor_open_unverified", "cancel_readonly_editor", "unknown"],
     status: ["native_timeout_setup_failed", "native_access_unavailable", "passwords_foreground_required", "incomplete_window_observation",
-      "user_editor_open", "locked", "unsupported_window", "no_standard_window", "locked_or_access_unavailable"],
+      "user_editor_open", "locked", "unsupported_window", "no_standard_window", "locked_or_access_unavailable", "unavailable"],
     ui_set_attribute: ["AXValue", "AXSelected", "AXSelectedRows", "AXSelectedText", "AXSelectedTextRange"],
     all_list_bridge_failure: ["owner_changed", "process_changed", "window_changed", "sheet_changed", "sidebar_changed", "category_changed",
       "search_changed", "query_changed", "clear_changed", "none", "unclassified_system_events_error"],
@@ -43,6 +44,8 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
     notes_observation_end: ["two_complete_writable_frames", "stable_unsupported", "transient_or_incomplete_timeout", "editable_fields_changed"],
     notes_probe_stage: ["input_validation", "initial_cohort", "initial_read", "initial_state", "notes_capabilities", "notes_structure",
       "first_cancel", "preservation_cohort", "preservation_read", "preservation_state", "final_cancel", "complete", "foreground_owner", "notes_focus"],
+    synthetic_input_stage: ["input_validation", "foreground_owner", "exact_read", "preimage", "notes_focus", "permission", "selection",
+      "text_input", "postimage", "save", "persisted_read", "final_cancel", "complete"],
   };
   for (const [name, allowed] of Object.entries(strings)) if (typeof raw[name] === "string" && allowed.includes(raw[name] as string)) out[name] = raw[name];
   for (const name of ["ui_set_error_code", "ui_press_error_code", "all_list_bridge_stage", "all_list_bridge_error_code", "all_list_bridge_exit_code",
@@ -59,6 +62,12 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
   for (const name of ["confirmation_bridge_timed_out", "confirmation_account_list_enumerated"]) {
     if (typeof raw[name] === "boolean") out[name]=raw[name];
   }
+  for (const name of ["synthetic_input_permission", "synthetic_input_selection_verified", "synthetic_input_postimage_verified",
+    "synthetic_input_persisted_verified", "synthetic_input_editor_requires_review"]) {
+    if (typeof raw[name] === "boolean") out[name]=raw[name];
+  }
+  const inputEvents=raw.synthetic_input_event_count;
+  if (typeof inputEvents === "number" && Number.isInteger(inputEvents) && inputEvents>=0 && inputEvents<=4) out.synthetic_input_event_count=inputEvents;
   for (const [name,max] of [["confirmation_bridge_exit_code",255],["confirmation_editor_path_depth",16]] as const) {
     const v=raw[name]; if (typeof v === "number" && Number.isInteger(v) && v>=0 && v<=max) out[name]=v;
   }
@@ -205,6 +214,36 @@ async function writeAll(file: Deno.FsFile, data: Uint8Array): Promise<void> {
   let n = 0; while (n < data.length) { const wrote = await file.write(data.subarray(n)); if (!wrote) fail("journal_write_failed"); n += wrote; }
   await file.sync();
 }
+async function verifySnapshotOutput(file: Deno.FsFile, path: string, reserved: Deno.FileInfo): Promise<void> {
+  await privateParent(path);
+  let opened: Deno.FileInfo, named: Deno.FileInfo;
+  try { opened = await file.stat(); named = await Deno.lstat(path); }
+  catch { fail("snapshot_unsafe"); }
+  // The helper may take time. Recheck both the reserved descriptor and its
+  // pathname before any cleartext write, rather than trusting initial mode.
+  if (reserved.ino === null || reserved.dev === null ||
+      [opened!, named!].some(f => !f.isFile || f.isSymlink || f.uid !== Deno.uid() ||
+        (f.mode! & 0o077) || f.nlink !== 1 || f.ino !== reserved.ino || f.dev !== reserved.dev)) fail("snapshot_unsafe");
+}
+async function writeSnapshot(file: Deno.FsFile, path: string, reserved: Deno.FileInfo, data: Uint8Array): Promise<void> {
+  await verifySnapshotOutput(file, path, reserved);
+  await writeAll(file, data);
+  await verifySnapshotOutput(file, path, reserved);
+}
+async function notesPreimage(path: string, target: Key, beforeHash: string): Promise<State> {
+  let file: Deno.FsFile | undefined;
+  try {
+    file=await Deno.open(path,{read:true});
+    const reserved=await file.stat(); await verifySnapshotOutput(file,path,reserved);
+    const raw=JSON.parse(new TextDecoder("utf-8",{fatal:true}).decode(await privateBytes(path)));
+    await verifySnapshotOutput(file,path,reserved);
+    if (!raw || raw.format!=="apw-item-snapshot-v1" || raw.sha256!==beforeHash) fail("outcome_requires_review");
+    const before=state(raw.state,target);
+    if (await hash(before)!==beforeHash) fail("outcome_requires_review");
+    return before;
+  } catch {return fail("outcome_requires_review");}
+  finally {file?.close();}
+}
 export async function readItem(title: string, username: string, output: string): Promise<void> {
   const target = { title, username }; if (!key(target)) fail("identity_invalid");
   output = await absolute(output); await privateParent(output);
@@ -212,8 +251,9 @@ export async function readItem(title: string, username: string, output: string):
   const file = await Deno.open(output, { createNew: true, write: true, mode: 0o600 });
   let native: Native | undefined;
   try {
+    const reserved = await file.stat(); await verifySnapshotOutput(file, output, reserved);
     native = new Native(); const value = await native.read(target);
-    await writeAll(file, encoder.encode(JSON.stringify({ format: "apw-item-snapshot-v1", sha256: await hash(value), state: value }) + "\n"));
+    await writeSnapshot(file, output, reserved, encoder.encode(JSON.stringify({ format: "apw-item-snapshot-v1", sha256: await hash(value), state: value }) + "\n"));
     console.log(JSON.stringify({ read: true, private_output: output, sha256: await hash(value), app_activated: false }));
   } finally { await native?.close(); file.close(); }
 }
@@ -226,9 +266,10 @@ export async function inspectItems(targetsPath: string, output: string): Promise
   const file=await Deno.open(output, {createNew:true,write:true,mode:0o600});
   let native:Native | undefined;
   try {
+    const reserved=await file.stat(); await verifySnapshotOutput(file,output,reserved);
     native=new Native(); const items=[];
     for (const target of plan!.targets) { const value=await native.read(target); items.push({state:value,sha256:await hash(value)}); }
-    await writeAll(file,encoder.encode(JSON.stringify({format:"apw-item-snapshots-v1",items})+"\n"));
+    await writeSnapshot(file,output,reserved,encoder.encode(JSON.stringify({format:"apw-item-snapshots-v1",items})+"\n"));
     console.log(JSON.stringify({read:true,count:items.length,private_output:output,app_activated:false}));
   } finally {await native?.close();file.close();}
 }
@@ -282,6 +323,65 @@ export async function probeNotesEditor(snapshotPath: string, foregroundFocus = f
       credentials_changed:0,journal_modified:false,app_activated:false,foreground_focus:foregroundFocus,diagnostics:safeDiagnostics(result.diagnostics)}));
   } finally {await native.close();}
 }
+export async function syntheticForegroundNotesInput(snapshotPath: string, notesFilePath: string, journalPath: string): Promise<void> {
+  let expected: State, notes: string, beforeHash: string;
+  try {
+    snapshotPath = await absolute(snapshotPath); notesFilePath = await absolute(notesFilePath);
+    await privateParent(snapshotPath); await privateParent(notesFilePath);
+    const raw = JSON.parse(new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(snapshotPath)));
+    if (!raw || raw.format !== "apw-item-snapshot-v1" || !raw.state || !key(raw.state.key)) fail("synthetic_notes_input_invalid");
+    expected = state(raw.state, raw.state.key);
+    if (Object.keys(expected).sort().join() !== "extra_fields,key,native_title,notes,otp,passkey,password,sharing,sites" ||
+        typeof raw.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(raw.sha256)) fail("synthetic_notes_input_invalid");
+    beforeHash = await hash(expected);
+    const existingTitles = ["apw API 测试 · SSO 与备注", "apw API 测试 · 独立备注"];
+    const syntheticSite = (site: string): boolean => {
+      try {
+        const url = new URL(site.includes("://") ? site : "https://" + site);
+        return ["http:", "https:"].includes(url.protocol) && url.hostname.endsWith(".invalid") && !url.username && !url.password;
+      } catch {return false;}
+    };
+    if (raw.sha256 !== beforeHash || !existingTitles.includes(expected.key.title) || expected.native_title !== expected.key.title ||
+        !expected.notes.includes("APW_EXCHANGE_SYNTHETIC_V1") || expected.password !== "" ||
+        (expected.key.username !== "" && !expected.key.username.endsWith(".invalid")) || !expected.sites.every(syntheticSite) ||
+        expected.sharing !== "unshared" || expected.extra_fields.length !== 0) fail("synthetic_notes_input_invalid");
+    notes = new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(notesFilePath));
+    const suffix = notes.slice(expected.notes.length);
+    // JS string length/slice use the exact UTF-16 units bound by the native API.
+    if (!notes.startsWith(expected.notes) || !suffix || suffix.length > 512 ||
+        !suffix.includes("APW_FOREGROUND_INPUT_SYNTHETIC_V1") || notes.length > 4096 || notes.includes("\0")) fail("synthetic_notes_input_invalid");
+  } catch {fail("synthetic_notes_input_invalid");}
+  const intended: State = {...expected!, notes:notes!}, afterHash = await hash(intended);
+  journalPath = await absolute(journalPath); await privateParent(journalPath);
+  let file: Deno.FsFile;
+  try {file = await Deno.open(journalPath, {createNew:true,write:true,mode:0o600});}
+  catch (e) {
+    if (e instanceof Deno.errors.AlreadyExists) fail("synthetic_notes_journal_exists");
+    fail("synthetic_notes_journal_unsafe");
+  }
+  let native: Native | undefined;
+  try {
+    const reserved = await file!.stat(); await verifySnapshotOutput(file!,journalPath,reserved);
+    const append = async (event: "intent" | "done" | "uncertain") => {
+      await writeSnapshot(file!,journalPath,reserved,encoder.encode(JSON.stringify({format:"apw-synthetic-notes-input-v1",event,
+        synthetic_only:true,before_sha256:beforeHash!,after_sha256:afterHash,at:new Date().toISOString()}) + "\n"));
+    };
+    await append("intent"); // private, fsynced intent always precedes the one call
+    try {
+      native = new Native();
+      const result = await native.call("synthetic-foreground-notes-input",{expected:expected!,key:expected!.key,notes:notes!,
+        synthetic_only:true,foreground_focus:true});
+      if (result.synthetic_only !== true || result.persisted !== true || result.credentials_changed !== 1 ||
+          result.exports !== 0 || result.imports !== 0 || result.app_activated !== false) fail("synthetic_notes_input_unverified");
+      let after: State;
+      try {after = state(result.state,expected!.key);} catch {fail("synthetic_notes_input_unverified");}
+      if (canonical(after!) !== canonical(intended) || await hash(after!) !== afterHash) fail("synthetic_notes_input_unverified");
+      await append("done");
+      console.log(JSON.stringify({synthetic_only:true,persisted:true,credentials_changed:1,exports:0,imports:0,app_activated:false,
+        before_sha256:beforeHash!,after_sha256:afterHash}));
+    } catch (e) {await append("uncertain");throw e;}
+  } finally {await native?.close();file!.close();}
+}
 export async function runBatch(planPath: string, journalPath: string, apply: boolean, onlyKind?: Operation["kind"], review=false): Promise<void> {
   const bytes = await privateBytes(planPath);
   let raw: unknown; try { raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { fail("plan_invalid"); }
@@ -322,10 +422,11 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
     }
     const opened = await file!.stat(), pathNow = await Deno.lstat(journalPath);
     if (!opened.isFile || opened.uid !== Deno.uid() || (opened.mode! & 0o077) || pathNow.isSymlink || pathNow.ino !== opened.ino) fail("journal_unsafe");
-    const append = async (o: Operation, event: string, after?: string, beforeNativeTitle?: string) => {
+    const append = async (o: Operation, event: string, after?: string, beforeNativeTitle?: string, beforeSnapshotPath?: string) => {
       const entry: Entry = { plan: planHash, id: o.id, event, before_sha256: o.before_sha256,
         ...(after ? { after_sha256: after } : {}),
         ...(event === "intent" && beforeNativeTitle !== undefined ? { before_native_title: beforeNativeTitle } : {}), at: new Date().toISOString() };
+      if (event==="intent" && beforeSnapshotPath!==undefined) entry.before_snapshot_path=beforeSnapshotPath;
       await writeAll(file!, encoder.encode(JSON.stringify(entry) + "\n")); history.push(entry);
     };
     native = new Native();
@@ -340,9 +441,25 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
       // Every completed/uncertain operation is verified read-only. Never replay intent.
       if (last && last.event!=="reviewed-no-change") {
         if (o.kind === "notes-set") {
+          const intent = prior.findLast(x => x.event === "intent"), intended = intent?.after_sha256;
+          const capturedTitle = intent?.before_native_title;
+          if (!intent || intent.before_sha256 !== o.before_sha256 || typeof intended !== "string" ||
+            !/^[a-f0-9]{64}$/.test(intended) ||
+            (capturedTitle !== undefined && (typeof capturedTitle !== "string" || capturedTitle.includes("\0")))) fail("outcome_requires_review");
+          // An after hash alone cannot authorize changes to passwords/sites or
+          // other fields. Reconstruct the unique intended state from the full
+          // private preimage bound to the unchanged original plan.
+          const preimagePath=journalPath+"."+o.id+".before.json";
+          if (intent?.before_snapshot_path!==preimagePath) fail("outcome_requires_review");
+          const before=await notesPreimage(preimagePath,o.target,o.before_sha256);
+          if (before.sharing!=="unshared" || !o.notes!.includes(before.notes) ||
+              (capturedTitle!==undefined && capturedTitle!==before.native_title)) fail("outcome_requires_review");
+          const expected={...before,notes:o.notes!}, expectedHash=await hash(expected);
+          if (intended!==expectedHash) fail("outcome_requires_review");
           const now = await native.read(o.target), h = await hash(now);
-          const intended = prior.findLast(x => x.event === "intent")?.after_sha256;
-          if (!intended || h !== intended) fail("outcome_requires_review");
+          // A private journal can still be damaged or copied incorrectly.
+          // Its after-hash never substitutes for the original plan's note body.
+          if (canonical(now)!==canonical(expected) || h!==expectedHash) fail("outcome_requires_review");
           if (last.event !== "done") await append(o, "done", h);
         } else {
           // Deleted notes cannot be edited. Bind placement/body verification to
@@ -374,7 +491,26 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
           o.source_ids!.some(x => !keeper.notes.includes(x))) fail("keeper_proof_refused");
       }
       const afterHash = intended ? await hash(intended) : undefined;
-      await append(o, "intent", afterHash, before.native_title); // fsync precedes any mutation
+      let beforeSnapshotPath: string | undefined;
+      if (intended) {
+        beforeSnapshotPath=journalPath+"."+o.id+".before.json";
+        let snapshot: Deno.FsFile | undefined;
+        try {snapshot=await Deno.open(beforeSnapshotPath,{createNew:true,write:true,mode:0o600});}
+        catch (e) {
+          // Only an explicitly reviewed unchanged operation can reuse its
+          // original exact preimage. Never overwrite or infer orphan evidence.
+          if (!(e instanceof Deno.errors.AlreadyExists) || last?.event!=="reviewed-no-change") fail("outcome_requires_review");
+          if (canonical(await notesPreimage(beforeSnapshotPath,o.target,o.before_sha256))!==canonical(before)) fail("outcome_requires_review");
+        }
+        if (snapshot) {
+          try {
+            const reserved=await snapshot.stat();
+            await writeSnapshot(snapshot,beforeSnapshotPath,reserved,encoder.encode(JSON.stringify({format:"apw-item-snapshot-v1",
+              sha256:o.before_sha256,state:before})+"\n"));
+          } finally {snapshot.close();}
+        }
+      }
+      await append(o, "intent", afterHash, before.native_title,beforeSnapshotPath); // both fsyncs precede any mutation
       try {
         const result = await native.call(o.kind, { key: o.target, expected: before, ...(intended ? { notes: intended.notes } : {}) });
         mutations++;

@@ -40,6 +40,11 @@ func requestLeaseMode(foreground:pid_t,passwords:pid_t,keyboard:pid_t?,ownedEdit
  if foreground==passwords {return keyboard==passwords ? "foreground":"refuse"}
  return keyboard==passwords ? "refuse":"background"
 }
+func unavailableContextStatus(editor:Bool,incomplete:Bool)->String {
+ // Text in a row or note (including "unlocked") cannot establish a lock
+ // screen. No authenticated-access permission follows from this status.
+ incomplete ? "incomplete_window_observation":(editor ? "user_editor_open":"unavailable")
+}
 func queryStrategy(rangeSettable:Bool,textSettable:Bool,valueSettable:Bool=false)->String {
  rangeSettable && textSettable ? "selected-text":(valueSettable ? "witnessed-value":"unfiltered-index")
 }
@@ -99,8 +104,8 @@ func notesProbeOutcomePermits(preimageExact:Bool,diagnosticsComplete:Bool,cancel
 func notesProbeFocusMatches(copyCode:Int,pidCode:Int,roleCode:Int,samePID:Bool,ancestorBound:Bool,role:String)->Bool {
  copyCode==0 && pidCode==0 && roleCode==0 && samePID && ancestorBound && ["AXTextField","AXTextArea","AXComboBox"].contains(role)
 }
-// These permissions apply only to the explicit foreground synthetic
-// diagnostic. Ordinary foreground/background leases remain unchanged.
+// These permissions apply only to explicit foreground synthetic operations.
+// Ordinary foreground/background leases remain unchanged.
 func notesProbeForegroundOwnerPermits(original:pid_t,foreground:pid_t,passwords:pid_t,keyboard:pid_t?,deadlineValid:Bool,internalComplete:Bool,internalBound:Bool)->Bool {
  passwords>0 && original==passwords && foreground==original &&
  (keyboard==nil || keyboard==passwords) && deadlineValid && internalComplete && internalBound
@@ -119,10 +124,36 @@ func notesProbeForegroundFocusOption(_ value:Any?)->Bool? {
  guard CFGetTypeID(value as CFTypeRef)==CFBooleanGetTypeID() else{return nil}
  return value as? Bool
 }
-func notesProbeReadCleanupPolicy(returnedComplete:Bool,openedByRead:Bool,ownerUnchanged:Bool,expectedComplete:Bool,listAvailable:Bool)->String {
+func notesProbeReadCleanupPolicy(returnedComplete:Bool,openedByRead:Bool,ownerUnchanged:Bool,expectedComplete:Bool,listAvailable:Bool,inputAttempted:Bool=false)->String {
  if returnedComplete,openedByRead {return "register_before_snapshot"}
+ if inputAttempted {return "requires_review"}
  if openedByRead,ownerUnchanged,expectedComplete {return "recover_expected_once"}
  return listAvailable ? "no_owned_editor":"requires_review"
+}
+// This separate synthetic mutation policy is never used by notes-set. A
+// filtered diagnostic cohort is not an identity authorization for input.
+func syntheticNotesAppendPermits(_ expected:[String:Any],_ after:String)->Bool {
+ guard notesProbeFixtureValid(expected),let key=expected["key"] as? [String:String],
+  let title=key["title"],["apw API 测试 · SSO 与备注","apw API 测试 · 独立备注"].contains(title),
+  expected["native_title"] as? String==title,let old=expected["notes"] as? String,
+  !after.contains("\0") else{return false}
+ let original=Array(old.utf16),replacement=Array(after.utf16)
+ guard replacement.count>original.count,replacement.count<=4096,
+  replacement.count-original.count<=512,Array(replacement.prefix(original.count))==original else{return false}
+ let suffix=String(decoding:replacement.dropFirst(original.count),as:UTF16.self)
+ return suffix.contains("APW_FOREGROUND_INPUT_SYNTHETIC_V1")
+}
+func foregroundNoteInputPermits(_ q:[String:Any])->Bool {
+ func yes(_ key:String)->Bool {notesProbeForegroundFocusOption(q[key])==true}
+ guard let expected=q["expected"] as? [String:Any],let notes=q["notes"] as? String,
+  syntheticNotesAppendPermits(expected,notes),let phase=q["phase"] as? String,
+  ["selection","replacement"].contains(phase) else{return false}
+ return yes("requested") && yes("synthetic_only") && yes("unique_index") && yes("owned_editor") &&
+  yes("two_frames") && yes("preimage_exact") && yes("raw_equal") && yes("process_verified") &&
+  yes("window_bound") && yes("note_bound") && yes("internal_focus_exact") && yes("observation_complete") &&
+  yes("post_access") && yes("physical_modifiers_clear") && !yes("input_attempted") &&
+  (phase=="selection" || yes("selection_verified")) &&
+  notesProbeForegroundOwnerPermits(original:pid_t(q["original"] as? Int ?? 0),foreground:pid_t(q["foreground"] as? Int ?? 0),passwords:pid_t(q["passwords"] as? Int ?? 0),keyboard:(q["keyboard"] as? Int).map(pid_t.init),deadlineValid:yes("deadline_valid"),internalComplete:yes("observation_complete"),internalBound:yes("internal_focus_exact"))
 }
 func sameIndexScope(cachedCategory:String,cachedQuery:String,category:String,query:String)->Bool {
  cachedCategory==category && cachedQuery==query
@@ -167,6 +198,7 @@ if args==["--policy-test"] {
  switch q["operation"] as? String {
  case "lease":
   result=requestLeaseMode(foreground:pid_t(q["foreground"] as? Int ?? 0),passwords:pid_t(q["passwords"] as? Int ?? 0),keyboard:(q["keyboard"] as? Int).map(pid_t.init),ownedEditor:q["owned_editor"] as? Bool ?? false)
+ case "unavailable-context-policy":result=unavailableContextStatus(editor:q["editor"] as? Bool ?? false,incomplete:q["incomplete"] as? Bool ?? false)
  case "query":result=queryStrategy(rangeSettable:q["range_settable"] as? Bool ?? false,textSettable:q["text_settable"] as? Bool ?? false,valueSettable:q["value_settable"] as? Bool ?? false)
  case "witness":result=acceptsSearchWitness(emptySeen:q["empty_seen"] as? Bool ?? false,stableComplete:q["stable_complete"] as? Bool ?? false,ownerUnchanged:q["owner_unchanged"] as? Bool ?? false,count:q["count"] as? Int ?? -1)
  case "recoverable-dialog":result=recoverableDialog(words:q["words"] as? [String] ?? [],ordinaryButton:q["ordinary_button"] as? Bool ?? false,permanentButton:q["permanent_button"] as? Bool ?? false)
@@ -183,7 +215,8 @@ if args==["--policy-test"] {
  case "notes-probe-focus-setter":result=notesProbeFocusSetterPermits(requested:q["requested"] as? Bool ?? false,expected:q["expected"] as? [String:Any] ?? [:],ownedEditor:q["owned_editor"] as? Bool ?? false,twoFrames:q["two_frames"] as? Bool ?? false,stateExact:q["state_exact"] as? Bool ?? false,uniqueNote:q["unique_note"] as? Bool ?? false,samePID:q["same_pid"] as? Bool ?? false,completeScope:q["complete_scope"] as? Bool ?? false,identifier:q["identifier"] as? String ?? "",role:q["role"] as? String ?? "",ownerValid:q["owner_valid"] as? Bool ?? false,settableCode:q["settable_code"] as? Int ?? -1,settable:q["settable"] as? Bool ?? false)
  case "notes-probe-error-cleanup":result=notesProbeErrorCleanupPermits(expected:q["expected"] as? [String:Any] ?? [:],first:q["first"] as? [String:Any] ?? [:],second:q["second"] as? [String:Any] ?? [:],complete:q["complete"] as? Bool ?? false,ownedEditor:q["owned_editor"] as? Bool ?? false,ownerValid:q["owner_valid"] as? Bool ?? false,rawEqual:q["raw_equal"] as? Bool ?? false)
  case "notes-probe-focus-option":result=notesProbeForegroundFocusOption(q["value"]).map{$0 ? "true":"false"} ?? "invalid"
- case "notes-probe-read-cleanup":result=notesProbeReadCleanupPolicy(returnedComplete:q["returned_complete"] as? Bool ?? false,openedByRead:q["opened_by_read"] as? Bool ?? false,ownerUnchanged:q["owner_unchanged"] as? Bool ?? false,expectedComplete:q["expected_complete"] as? Bool ?? false,listAvailable:q["list_available"] as? Bool ?? false)
+ case "notes-probe-read-cleanup":result=notesProbeReadCleanupPolicy(returnedComplete:q["returned_complete"] as? Bool ?? false,openedByRead:q["opened_by_read"] as? Bool ?? false,ownerUnchanged:q["owner_unchanged"] as? Bool ?? false,expectedComplete:q["expected_complete"] as? Bool ?? false,listAvailable:q["list_available"] as? Bool ?? false,inputAttempted:q["input_attempted"] as? Bool ?? false)
+ case "foreground-note-input-policy":result=foregroundNoteInputPermits(q)
  case "cache":result=sameIndexScope(cachedCategory:q["cached_category"] as? String ?? "",cachedQuery:q["cached_query"] as? String ?? "",category:q["category"] as? String ?? "",query:q["query"] as? String ?? "")
  default:exit(2)
  }
@@ -275,7 +308,7 @@ func safeBackgroundOwner(_ original:pid_t)->Bool {
 }
 func front()->Bool {
  // A nil system-wide keyboard observation is not a foreign PID. This
- // diagnostic-only lease requires positive focus evidence from Passwords
+ // synthetic-only lease requires positive focus evidence from Passwords
  // itself into the previously verified exact window on every owner check.
  if let window=foregroundNotesProbeWindow,let original=foregroundNotesProbeOriginalPID {
   let root=AXUIElementCreateApplication(appPID)
@@ -710,7 +743,7 @@ func cancel(_ root:AXUIElement,_ n:NativeRead,actionGuard:(()->Bool)?=nil)->Bool
  report["cancel_context"]=["foreground":front(),"fields_unchanged":fields(ns)==n.fieldValues,"selected_row":attr(n.row,kAXSelectedAttribute) as? Bool==true,"cancel_button_unique":button(ns,["取消","Cancel"]) != nil]
  guard front(),fields(ns)==n.fieldValues,let b=button(ns,["取消","Cancel"]),actionGuard?() ?? true,boundedClick(b,root) else{return false}
  guard waitForList(root) else{return false}
- if let (ownedRoot,_)=ownEditor,CFEqual(root,ownedRoot) {ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false}
+ if let (ownedRoot,_)=ownEditor,CFEqual(root,ownedRoot) {ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false;ownSyntheticInputAttempted=false}
  return true
 }
 func waitForList(_ root:AXUIElement,seconds:TimeInterval=3)->Bool {
@@ -729,8 +762,7 @@ func ready()->AXUIElement? {
  let root=AXUIElementCreateApplication(appPID);AXUIElementSetMessagingTimeout(root,0.25)
  guard context(root) != nil else{
   let ns=nodes(root),editor=ns.contains{n in ["TitleField","UserNameField","PasswordField","NotesField"].contains(text(n,kAXIdentifierAttribute)) && ["AXTextField","AXTextArea","AXComboBox"].contains(text(n,kAXRoleAttribute))}
-  let locked=values(ns).contains{v in v.contains("已锁定") || v.contains("解锁") || v.lowercased().contains("locked") || v.lowercased().contains("unlock") || v.contains("Touch ID")}
-  report["status"]=nativeObservationIncomplete ? "incomplete_window_observation":(editor ? "user_editor_open":(locked ? "locked":(ns.contains{text($0,kAXSubroleAttribute)=="AXStandardWindow"} ? "unsupported_window":"no_standard_window")))
+  report["status"]=unavailableContextStatus(editor:editor,incomplete:nativeObservationIncomplete)
   return nil
  }
  report["apple_process_verified"]=true;return root
@@ -940,6 +972,9 @@ var ownEditor:(AXUIElement,NativeRead)?
 var ownEditorFields:[String:String]?
 var ownNotesProbeExpected:[String:Any]?
 var ownNotesProbeCleanupAttempted=false
+// An attempted synthetic event may have changed an editor even when no
+// response arrived. Such an editor is retained for explicit review.
+var ownSyntheticInputAttempted=false
 func acquireRequestLease()throws {
  try require(ownEditor==nil,"owned_editor_requires_review")
  // NSWorkspace delivers activation changes on the run loop. Initialize and
@@ -964,6 +999,12 @@ func acquireRequestLease()throws {
  report["request_owner_mode"]=mode
 }
 func closeOwnEditor() {
+ // Save may already have returned to the list when its independent reread
+ // fails. Unknown ownership is still an uncertain attempted mutation.
+ if ownSyntheticInputAttempted {
+  report["synthetic_input_editor_requires_review"]=true
+  return
+ }
  guard let (root,n)=ownEditor,let expected=ownEditorFields else{return}
  if let probeExpected=ownNotesProbeExpected {
   guard front() else{report["notes_probe_editor_requires_review"]=true;return}
@@ -1273,7 +1314,7 @@ func snapshot(_ key:[String:String],_ n:NativeRead)throws->[String:Any] {
  return ["key":key,"native_title":title,"notes":notes,"password":password,"sites":n.sites.sorted(),"sharing":n.shared,
   "otp":n.otpAbsent ? "absent":"unknown","passkey":n.passkeyAbsent ? "absent":"unknown","extra_fields":extra]
 }
-func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=false)throws->(AXUIElement,NativeRead,[String:Any]) {
+func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=false,guardedExpected:[String:Any]?=nil)throws->(AXUIElement,NativeRead,[String:Any]) {
  let root=try freshRoot();try selectCategory(root,category,buildIndex:false)
  guard let title=key["title"],!title.isEmpty,let user=key["username"] else{throw nativeFailure("identity_invalid")}
  guard let (search,_) = context(root) else{throw nativeFailure("locked_or_user_editor")}
@@ -1344,13 +1385,22 @@ func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=fal
  let matches=labels.filter{$0.contains(title) && (user.isEmpty || $0.contains(user))}
  try require(matches.count>0,"item_not_found");try require(matches.count==1,"item_ambiguous")
  let target=Target(title:title,native_title:title,username:user,notes:"",urls:[])
- guard let n=read(root,target,leaveOpen:true) else {
-  let stage=report["failure_stage"] as? String ?? "unknown"
-  throw nativeFailure("native_read_"+(stage.allSatisfy({$0.isLowercase || $0=="_"}) ? stage:"unknown"))
+ let n:NativeRead
+ if let expected=guardedExpected {
+  // Identity still comes from this exact query/complete-index path. The
+  // ownership helper only ensures a partial editor read cannot be blindly
+  // canceled using cached metadata; it grants no cohort/index permission.
+  n=try ownedNotesProbeRead(root,target,expected)
+ } else {
+  guard let observed=read(root,target,leaveOpen:true) else {
+   let stage=report["failure_stage"] as? String ?? "unknown"
+   throw nativeFailure("native_read_"+(stage.allSatisfy({$0.isLowercase || $0=="_"}) ? stage:"unknown"))
+  }
+  n=observed
  }
  ownEditor=(root,n);ownEditorFields=n.fieldValues
  let value:[String:Any]
- do {value=try snapshot(key,n)} catch { _=cancel(root,n);throw error }
+ do {value=try snapshot(key,n)} catch {if guardedExpected==nil {_=cancel(root,n)};throw error}
  if !leaveOpen {try require(cancel(root,n),"editor_cancel_unverified");ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false}
  return (root,n,value)
 }
@@ -1502,7 +1552,7 @@ func notesProbeCurrentNote(_ frame:NativeRead)->AXUIElement? {
  }
  return observed ?? nil
 }
-// The only AXFocused setter in the helper. It is diagnostic-only, one-shot,
+// The only AXFocused setter in the helper. It is synthetic-only, one-shot,
 // and does not go through or weaken the generic set() prohibition.
 func rawSetNotesProbeFocus(_ root:AXUIElement,_ expected:[String:Any],_ key:[String:String])throws {
  try require(report["focus_requested"] as? Bool==true && foregroundNotesProbeWindow != nil && front(),"notes_probe_focus_scope_unverified")
@@ -1613,12 +1663,24 @@ func ownedNotesProbeRead(_ root:AXUIElement,_ target:Target,_ expected:[String:A
   foregroundBefore != nil && (keyboardBefore != nil || foregroundNotesProbeWindow != nil) && NSWorkspace.shared.frontmostApplication?.processIdentifier==foregroundBefore && focusPID()==keyboardBefore && front()
  }
  let expectedComplete=editorRecoveryPermits(expected:expected,observed:expected,complete:true,unique:true)
- if notesProbeReadCleanupPolicy(returnedComplete:complete,openedByRead:openedByRead,ownerUnchanged:originalOwnerUnchanged(),expectedComplete:expectedComplete,listAvailable:false)=="register_before_snapshot",let observed {
+ let initialPolicy=notesProbeReadCleanupPolicy(returnedComplete:complete,openedByRead:openedByRead,ownerUnchanged:originalOwnerUnchanged(),expectedComplete:expectedComplete,listAvailable:false,inputAttempted:ownSyntheticInputAttempted)
+ if initialPolicy=="register_before_snapshot",let observed {
   // The exact complete editor belongs to this read before snapshot() can
   // throw. Existing readonly cleanup can now close it only if unchanged.
   ownEditor=(root,observed);ownEditorFields=observed.fieldValues
   ownNotesProbeExpected=expected;ownNotesProbeCleanupAttempted=false
   return observed
+ }
+ if initialPolicy=="requires_review",ownSyntheticInputAttempted {
+  // A partial post-input read is not a new readonly recovery permission.
+  // Preserve any exact editor provenance actually returned by this read;
+  // never fabricate complete state or cancel from cached metadata.
+  if openedByRead,let observed {
+   ownEditor=(root,observed);ownEditorFields=observed.fieldValues
+   ownNotesProbeExpected=expected
+  }
+  report["synthetic_input_editor_requires_review"]=true
+  throw nativeFailure("editor_requires_review")
  }
  let listAvailable=completeDiscovery({context(root) != nil})==true
  let policy=notesProbeReadCleanupPolicy(returnedComplete:complete,openedByRead:openedByRead,ownerUnchanged:originalOwnerUnchanged(),expectedComplete:expectedComplete,listAvailable:listAvailable)
@@ -1690,6 +1752,151 @@ func notesEditorProbe(_ expected:[String:Any],_ key:[String:String],foregroundFo
  var diagnostics:[String:Any]=[:]
  for name in ["notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","focus_requested","focus_settable","focus_set_code","focus_verified"] {if let value=report[name] {diagnostics[name]=value}}
  return ["ok":true,"probed":true,"synthetic_only":true,"mutation_authorized":false,"current_cohort_only":true,"credentials_changed":0,"journal_modified":false,"app_activated":false,"foreground_focus":foregroundFocus,"diagnostics":diagnostics]
+}
+func literalNotesStateEqual(_ first:[String:Any],_ second:[String:Any])->Bool {
+ guard equalState(first,second),let a=first["notes"] as? String,let b=second["notes"] as? String else{return false}
+ return a.utf16.elementsEqual(b.utf16)
+}
+func syntheticInputFullSelection(_ note:AXUIElement,_ count:Int)->Bool {
+ completeDiscovery {()->Bool in
+  guard let value=attr(note,kAXSelectedTextRangeAttribute),CFGetTypeID(value)==AXValueGetTypeID() else{return false}
+  var range=CFRange()
+  return AXValueGetValue(unsafeBitCast(value,to:AXValue.self),.cfRange,&range) && range.location==0 && range.length==count
+ }==true
+}
+// A new positive PID/window/focus/whole-state proof is required immediately
+// before AND after each addressed event. Posting itself has no success value.
+func syntheticInputEventProof(_ root:AXUIElement,_ key:[String:String],_ expected:[String:Any],_ postimage:[String:Any],_ raw:[String:String],_ note:AXUIElement,allowPostimage:Bool)throws->NativeRead {
+ let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
+ try require(running.count==1 && running[0].processIdentifier==appPID && apple(appPID) && front(),"synthetic_input_owner_changed")
+ let frame=try observeReadonlyEditor(root,key)
+ let original=literalNotesStateEqual(frame.1,expected),planned=literalNotesStateEqual(frame.1,postimage)
+ try require(original || (allowPostimage && planned),"synthetic_input_state_changed")
+ try require(frame.0.fieldValues.filter{$0.key != "NotesField"}==raw.filter{$0.key != "NotesField"},"synthetic_input_state_changed")
+ let proof=completeDiscovery {()->Bool in
+  guard let current=notesProbeCurrentNote(frame.0),CFEqual(current,note),
+   notesProbeBoundInternalFocus(root,note,editableOnly:true) != nil,
+   let window=foregroundNotesProbeWindow,notesProbeAncestorBound(note,window) else{return false}
+  return front()
+ }
+ try require(proof==true,"synthetic_input_focus_changed")
+ return frame.0
+}
+func syntheticForegroundNotesInput(_ expected:[String:Any],_ key:[String:String],_ after:String)throws->[String:Any] {
+ report["synthetic_input_stage"]="exact_read"
+ ownSyntheticInputAttempted=false
+ // The diagnostic current-cohort shortcut is deliberately not used here.
+ let (root,n,before)=try readKey(key,leaveOpen:true,guardedExpected:expected)
+ ownNotesProbeExpected=expected;ownNotesProbeCleanupAttempted=false
+ report["synthetic_input_stage"]="preimage"
+ try require(literalNotesStateEqual(before,expected) && syntheticNotesAppendPermits(expected,after),"synthetic_input_preimage_changed")
+ let first=try observeReadonlyEditor(root,key);pause(0.04)
+ let second=try observeReadonlyEditor(root,key)
+ try require(literalNotesStateEqual(first.1,expected) && literalNotesStateEqual(second.1,expected) &&
+  first.0.fieldValues==n.fieldValues && second.0.fieldValues==n.fieldValues,"synthetic_input_preimage_changed")
+ report["synthetic_input_stage"]="notes_focus"
+ try rawSetNotesProbeFocus(root,expected,key)
+ guard let note=notesProbeCurrentNote(second.0) else{throw nativeFailure("synthetic_input_note_unverified")}
+ var postimage=expected;postimage["notes"]=after
+ let old=(expected["notes"] as! String).utf16.count
+ report["synthetic_input_stage"]="permission"
+ let access=CGPreflightPostEventAccess()
+ report["synthetic_input_permission"]=access
+ try require(access,"synthetic_input_permission_absent")
+ try require(CGEventSource.flagsState(.hidSystemState).rawValue==0,"synthetic_input_physical_modifiers_present")
+ var eventCount=0,selectionVerified=false,textAttempted=false
+ func send(_ event:CGEvent,phase:String,allowPostimage:Bool,requireSelection:Bool=false)throws {
+  _=try syntheticInputEventProof(root,key,expected,postimage,n.fieldValues,note,allowPostimage:allowPostimage)
+  let selection = !requireSelection || syntheticInputFullSelection(note,old)
+  let windowBound=foregroundNotesProbeWindow.map{notesProbeAncestorBound(note,$0)} ?? false
+  let observations:[String:Any]=["requested":true,"synthetic_only":true,"expected":expected,"notes":after,"phase":phase,
+   "unique_index":true,"owned_editor":ownEditor != nil,"two_frames":true,"preimage_exact":true,"raw_equal":true,
+   "original":Int(foregroundNotesProbeOriginalPID ?? 0),"foreground":Int(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? 0),
+   "passwords":Int(appPID),"keyboard":focusPID().map{Int($0)} as Any,"process_verified":true,"window_bound":windowBound,
+   "note_bound":true,"internal_focus_exact":true,"observation_complete":true,"post_access":CGPreflightPostEventAccess(),
+   "physical_modifiers_clear":CGEventSource.flagsState(.hidSystemState).rawValue==0,"selection_verified":selectionVerified && selection,
+   "input_attempted":false,"deadline_valid":Date()<deadline]
+  try require(foregroundNoteInputPermits(observations),"synthetic_input_scope_unverified")
+  try require(eventCount<4 && (phase=="selection" ? !textAttempted:true),"synthetic_input_retry_refused")
+  // Set attempted provenance before the void post call. There is no global
+  // input alternative, per-character retry or clipboard route.
+  ownSyntheticInputAttempted=true;eventCount+=1
+  report["synthetic_input_event_count"]=eventCount
+  event.postToPid(appPID)
+  _=try syntheticInputEventProof(root,key,expected,postimage,n.fieldValues,note,allowPostimage:allowPostimage)
+ }
+ report["synthetic_input_stage"]="selection"
+ if !syntheticInputFullSelection(note,old) {
+  guard let down=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false) else{throw nativeFailure("synthetic_input_event_creation_failed")}
+  down.flags=[.maskCommand];up.flags=[.maskCommand]
+  try send(down,phase:"selection",allowPostimage:false)
+  try send(up,phase:"selection",allowPostimage:false)
+ }
+ let selectionUntil=min(deadline,Date(timeIntervalSinceNow:3));var selectionFrames=0
+ while front(),Date()<selectionUntil {
+  _=try syntheticInputEventProof(root,key,expected,postimage,n.fieldValues,note,allowPostimage:false)
+  if syntheticInputFullSelection(note,old) {selectionFrames+=1;if selectionFrames==2 {selectionVerified=true;break}}
+  else {selectionFrames=0}
+  pause(0.04)
+ }
+ report["synthetic_input_selection_verified"]=selectionVerified
+ try require(selectionVerified,"synthetic_input_selection_unverified")
+ report["synthetic_input_stage"]="text_input"
+ guard let down=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:true),let up=CGEvent(keyboardEventSource:nil,virtualKey:0,keyDown:false) else{throw nativeFailure("synthetic_input_event_creation_failed")}
+ let units=Array(after.utf16)
+ units.withUnsafeBufferPointer {buffer in
+  down.keyboardSetUnicodeString(stringLength:buffer.count,unicodeString:buffer.baseAddress!)
+  up.keyboardSetUnicodeString(stringLength:buffer.count,unicodeString:buffer.baseAddress!)
+ }
+ down.flags=[];up.flags=[]
+ try send(down,phase:"replacement",allowPostimage:true,requireSelection:true)
+ textAttempted=true
+ try send(up,phase:"replacement",allowPostimage:true)
+ report["synthetic_input_stage"]="postimage"
+ let until=min(deadline,Date(timeIntervalSinceNow:3));var observedPost:NativeRead?,postFrames=0
+ while front(),Date()<until {
+  _=try syntheticInputEventProof(root,key,expected,postimage,n.fieldValues,note,allowPostimage:true)
+  let frame=try observeReadonlyEditor(root,key)
+  if literalNotesStateEqual(frame.1,postimage) && frame.0.fieldValues.filter({$0.key != "NotesField"})==n.fieldValues.filter({$0.key != "NotesField"}) {
+   postFrames+=1;observedPost=frame.0;if postFrames==2 {break}
+  } else {postFrames=0;observedPost=nil}
+  pause(0.04)
+ }
+ report["synthetic_input_postimage_verified"]=postFrames==2
+ guard postFrames==2,let post=observedPost else{throw nativeFailure("synthetic_input_postimage_unverified")}
+ // Register the complete proved postimage. On an error it is still retained
+ // for review, never silently canceled or restored after attempted input.
+ ownEditor=(root,post);ownEditorFields=post.fieldValues;ownNotesProbeExpected=postimage
+ report["synthetic_input_stage"]="save"
+ _=try syntheticInputEventProof(root,key,expected,postimage,n.fieldValues,note,allowPostimage:true)
+ let savedScope=completeDiscovery {()->AXUIElement? in
+  let ns=nodes(root)
+  guard fields(ns)==post.fieldValues else{return nil}
+  return button(ns,["保存","Save","完成","Done"])
+ }
+ guard let save=savedScope ?? nil else{throw nativeFailure("synthetic_input_save_unverified")}
+ // One semantic AXPress attempt only; no script retry after a lost reply.
+ try require(press(save) && waitForList(root),"synthetic_input_save_unverified")
+ ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false
+ report["synthetic_input_stage"]="persisted_read"
+ // Discard the filtered row binding before the independent exact query/index
+ // read. Preserve a full category cache only if its normal generation guards
+ // still validate it; never install the diagnostic cohort as an index.
+ indexedLabels=nil;indexedCategory="";indexedQuery="";boundQuery=""
+ let (readRoot,reread,state)=try readKey(key,leaveOpen:true,guardedExpected:postimage)
+ try require(literalNotesStateEqual(state,postimage),"synthetic_input_persistence_changed")
+ let persistedFirst=try observeReadonlyEditor(readRoot,key);pause(0.04)
+ let persistedSecond=try observeReadonlyEditor(readRoot,key)
+ try require(literalNotesStateEqual(persistedFirst.1,postimage) && literalNotesStateEqual(persistedSecond.1,postimage) &&
+  persistedFirst.0.fieldValues==reread.fieldValues && persistedSecond.0.fieldValues==reread.fieldValues,"synthetic_input_persistence_changed")
+ report["synthetic_input_persisted_verified"]=true
+ report["synthetic_input_stage"]="final_cancel"
+ try require(cancel(readRoot,persistedSecond.0),"synthetic_input_final_cancel_unverified")
+ report["synthetic_input_stage"]="complete"
+ var diagnostics:[String:Any]=[:]
+ for name in ["synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified"] {if let value=report[name] {diagnostics[name]=value}}
+ return ["ok":true,"synthetic_only":true,"foreground_focus":true,"persisted":true,"credentials_changed":1,
+  "app_activated":false,"exports":0,"imports":0,"state":state,"diagnostics":diagnostics]
 }
 func deletedNote(_ key:[String:String],_ expected:[String:Any])throws->[String:Any] {
  // Recently Deleted is immutable until recovery. Verify the complete note in
@@ -1772,7 +1979,6 @@ func execute(_ q:[String:Any])throws->[String:Any] {
    for n in ns {structure[text(n,kAXRoleAttribute),default:0]+=1}
    for n in ns where ["TitleField","UserNameField","PasswordField","NotesField"].contains(text(n,kAXIdentifierAttribute)) {fieldRoles[text(n,kAXIdentifierAttribute)]=text(n,kAXRoleAttribute)}
    editorCount=fieldRoles.values.filter{["AXTextField","AXTextArea","AXComboBox"].contains($0)}.count
-   let windows=ns.filter{text($0,kAXSubroleAttribute)=="AXStandardWindow"}
    let search=ns.filter{text($0,kAXRoleAttribute)=="AXTextField" && text($0,kAXSubroleAttribute)=="AXSearchField"}
    searchShape["count"]=search.count
    if search.count==1 {
@@ -1794,8 +2000,7 @@ func execute(_ q:[String:Any])throws->[String:Any] {
    }
    if editorCount>0 {windowState="user_editor_open"}
    else if ns.contains(where:{text($0,kAXIdentifierAttribute)=="AccountListView"}) && search.count==1 {windowState="unlocked_list_available"}
-   else if values(ns).contains(where:{v in v.contains("已锁定") || v.contains("解锁") || v.lowercased().contains("locked") || v.lowercased().contains("unlock") || v.contains("Touch ID")}) {windowState="locked"}
-   else {windowState=windows.isEmpty ? "no_standard_window":"unsupported_window"}
+   else {windowState=unavailableContextStatus(editor:false,incomplete:nativeObservationIncomplete)}
    complete = !nativeObservationIncomplete
    if !complete {windowState="incomplete_window_observation"}
    for category in ["active","deleted"] {
@@ -1813,7 +2018,7 @@ func execute(_ q:[String:Any])throws->[String:Any] {
    "passwords_frontmost":running.count==1 && NSWorkspace.shared.frontmostApplication?.processIdentifier==running[0].processIdentifier,
    "whole_vault_public_api":false,"native_protocol_delete_assumed":false]
  }
- try require(["read","deleted-read","notes-set","delete-redundant-note","recover-readonly-editor","notes-editor-probe"].contains(op),"operation_unsupported")
+ try require(["read","deleted-read","notes-set","delete-redundant-note","recover-readonly-editor","notes-editor-probe","synthetic-foreground-notes-input"].contains(op),"operation_unsupported")
  let recovery=q["expected"] as? [String:Any]
  var foregroundFocus=false
  guard let key=(q["key"] as? [String:String]) ?? (["recover-readonly-editor","notes-editor-probe"].contains(op) ? recovery?["key"] as? [String:String]:nil),Set(key.keys)==Set(["title","username"]),!(key["title"] ?? "").isEmpty else{throw nativeFailure("identity_invalid")}
@@ -1824,7 +2029,20 @@ func execute(_ q:[String:Any])throws->[String:Any] {
   report["focus_requested"]=requested;report["focus_settable"]=false;report["focus_verified"]=false
   try require(q["synthetic_only"] as? Bool==true && recovery != nil && notesProbeFixtureValid(recovery!) && (recovery!["key"] as? [String:String])==key,"notes_probe_synthetic_input_required")
  }
- if appPID==0,op != "notes-editor-probe" {
+ if op=="synthetic-foreground-notes-input" {
+  report["synthetic_input_stage"]="input_validation"
+  report["synthetic_input_event_count"]=0;report["synthetic_input_permission"]=false
+  report["synthetic_input_selection_verified"]=false;report["synthetic_input_postimage_verified"]=false
+  report["synthetic_input_persisted_verified"]=false;report["synthetic_input_editor_requires_review"]=false
+  try require(q["synthetic_only"] != nil && q["foreground_focus"] != nil &&
+   notesProbeForegroundFocusOption(q["synthetic_only"])==true && notesProbeForegroundFocusOption(q["foreground_focus"])==true,
+   "synthetic_input_explicit_flags_required")
+  guard let expected=recovery,let after=q["notes"] as? String,(expected["key"] as? [String:String])==key,
+   syntheticNotesAppendPermits(expected,after) else{throw nativeFailure("synthetic_input_fixture_required")}
+  foregroundFocus=true
+  report["focus_requested"]=true;report["focus_settable"]=false;report["focus_verified"]=false
+ }
+ if appPID==0,!["notes-editor-probe","synthetic-foreground-notes-input"].contains(op) {
   if NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords").isEmpty {_=try execute(["op":"connect"])}
  }
  let applications=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
@@ -1833,13 +2051,20 @@ func execute(_ q:[String:Any])throws->[String:Any] {
   activeLabels=nil;deletedLabels=nil;indexedLabels=nil;currentCategory="";indexedCategory="";indexedQuery="";boundQuery="";failedIndexCategories=[];valueSearchAvailable=true
  }
  appPID=a.processIdentifier
- if op=="notes-editor-probe",foregroundFocus {try beginForegroundNotesProbeLease()}
+ if ["notes-editor-probe","synthetic-foreground-notes-input"].contains(op),foregroundFocus {
+  if op=="synthetic-foreground-notes-input" {report["synthetic_input_stage"]="foreground_owner"}
+  try beginForegroundNotesProbeLease()
+ }
  try acquireRequestLease()
  var windows:CFTypeRef?
  let windowsCode=AXUIElementCopyAttributeValue(AXUIElementCreateApplication(appPID),kAXWindowsAttribute as CFString,&windows)
  if op=="notes-editor-probe" {
   try require(windowsCode == .success && (windows as? [AXUIElement])?.isEmpty==false,"notes_probe_window_unavailable")
   return try notesEditorProbe(recovery!,key,foregroundFocus:foregroundFocus)
+ }
+ if op=="synthetic-foreground-notes-input" {
+  try require(windowsCode == .success && (windows as? [AXUIElement])?.isEmpty==false,"synthetic_input_window_unavailable")
+  return try syntheticForegroundNotesInput(recovery!,key,q["notes"] as! String)
  }
  if windowsCode == .success,let ws=windows as? [AXUIElement],ws.isEmpty {_=try execute(["op":"connect"])}
  if op=="recover-readonly-editor" {
@@ -1911,7 +2136,7 @@ guard args==["--serve"] else {fputs("maintenance_invalid_entry_point\n",stderr);
 while let line=readLine(strippingNewline:true) {
  deadline=Date(timeIntervalSinceNow:90);nativeObservationIncomplete=false
  foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil
- for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified"] {report[key]=nil}
+ for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {report[key]=nil}
  var response:[String:Any]=["ok":false,"app_activated":false,"backend":"apple-passwords-accessibility"]
  do {
   guard line.utf8.count<=4*1024*1024,let bytes=line.data(using:.utf8),let q=try JSONSerialization.jsonObject(with:bytes) as? [String:Any],let id=q["id"] as? Int else{throw nativeFailure("request_invalid")}
@@ -1923,7 +2148,7 @@ while let line=readLine(strippingNewline:true) {
   response["error"]=message.hasPrefix("maintenance_") && message.dropFirst(12).allSatisfy({$0.isLowercase || $0=="_"}) ? message:"maintenance_native_operation_failed"
   // Return only structural reasons. Never expose field values in diagnostics.
   var diagnostics:[String:Any]=[:]
-  for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified"] {
+  for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {
    if let value=report[key] {diagnostics[key]=value}
   }
   response["diagnostics"]=diagnostics

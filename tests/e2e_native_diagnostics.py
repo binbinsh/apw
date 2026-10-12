@@ -182,8 +182,10 @@ def main():
             }
             reply = run("malformed-allowed-keys", malformed)
             check("allowed diagnostic keys reject free text, containers and wrong scalar types", reply.get("diagnostics", {}) == {})
+            reply = run("unavailable-status", {"status": "unavailable", "notes": SECRET})
+            check("known unavailable context classification survives without free text", reply.get("diagnostics") == {"status": "unavailable"})
             records = [json.loads(line) for line in calls.read_text().splitlines()]
-            check("one failing native read per invocation, without retry", records == [{"op": "read"}, {"op": "read"}])
+            check("one failing native read per invocation, without retry", records == [{"op": "read"}, {"op": "read"}, {"op": "read"}])
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
 

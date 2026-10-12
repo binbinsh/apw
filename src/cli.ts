@@ -8,7 +8,7 @@ import type { PasswordEntry, Payload } from "./types.ts";
 import { ensureStarted } from "./startup.ts";
 import { exchangeStatus, launchExchangeDemo, launchOTPLoginDemo, prepareExchangeComponent } from "./exchange.ts";
 import { launchNotesImport, prepareNotes } from "./notes.ts";
-import { readItem, inspectItems, runBatch, maintenanceDoctor, maintenanceConnect, recoverEditor, probeNotesEditor } from "./maintenance.ts";
+import { readItem, inspectItems, runBatch, maintenanceDoctor, maintenanceConnect, recoverEditor, probeNotesEditor, syntheticForegroundNotesInput } from "./maintenance.ts";
 import { capabilities } from "./capabilities.ts";
 
 const client = new ApplePasswordManager();
@@ -174,6 +174,15 @@ const batch = new Command().description("Recoverable, resumable maintenance batc
     .option("--output <path:string>", "New private snapshot file.", {required:true})
     .action(async (o:{targets:string;output:string}) => await inspectItems(o.targets,o.output)));
 const item = new Command().description("Exact native item/notes maintenance; never activates an app.")
+  .command("test-notes-input", new Command().description("One journaled notes-input trial on two exact pre-existing synthetic fixtures; Passwords must already be foreground.")
+    .option("--snapshot <path:string>", "Private hash-verified original synthetic snapshot.", {required:true})
+    .option("--notes-file <path:string>", "Private UTF-8 notes preserving the complete original body.", {required:true})
+    .option("--journal <path:string>", "New private one-shot journal; existing journals are never retried.", {required:true})
+    .option("--foreground-synthetic", "Explicitly allow this narrow synthetic foreground trial; never activates an app.")
+    .action(async (o:{snapshot:string;notesFile:string;journal:string;foregroundSynthetic?:boolean}) => {
+      if (o.foregroundSynthetic !== true) throw new APWError(Status.INVALID_PARAM,"maintenance_synthetic_foreground_required");
+      await syntheticForegroundNotesInput(o.snapshot,o.notesFile,o.journal);
+    }))
   .command("probe-notes", new Command().description("Read-only NotesField diagnosis on a hash-verified pre-existing synthetic fixture; never changes search or authorizes a mutation.")
     .option("--snapshot <path:string>","Original private synthetic item snapshot.",{required:true})
     .option("--foreground-focus","Explicit synthetic-only field-focus diagnosis; Passwords must already be foreground. Never activates it.")
@@ -345,7 +354,7 @@ try {
       ["apple_otp_account_selection_required", "apple_otp_user_authentication_required", "apple_password_user_authentication_required",
         "apple_native_timeout", "apple_native_reply_invalid", "apple_native_request_failed", "apple_native_channel_busy",
         "apple_native_frame_exhausted", "apple_native_operation_failed", "apple_native_response_invalid", "apple_browser_mode_invalid",
-        "apple_native_wait_invalid", "apple_native_wait_expired", "apple_password_wait_invalid"].includes(error.message) ||
+        "apple_native_wait_invalid", "apple_native_wait_expired", "apple_password_wait_invalid", "apple_password_value_unavailable"].includes(error.message) ||
       /^(maintenance_|unsafe_apple_|pair_requires_terminal|apple_pairing_failed|invalid_pairing_code|extension_verification_failed|apple_daemon_already_running|apple_write_unverified|exchange_)/
           .test(error.message)
         ? error.message

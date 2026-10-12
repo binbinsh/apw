@@ -14,9 +14,9 @@ blind deletion, permanent deletion, or automatic mutation retry.
 
 Passwords has no public developer API for arbitrary whole-library notes editing
 or deletion. These new commands use a bundled Swift Accessibility backend,
-verified against Apple's signed Passwords process. They do not bypass unlocking,
-activate the application or generate keyboard/mouse events. Default commands
-do not set focus. The explicitly requested synthetic foreground probe described
+verified against Apple's signed Passwords process. They do not bypass unlocking
+or activate the application. Default commands do not generate keyboard/mouse
+events or set focus. The explicitly requested synthetic foreground probe described
 below has a separate, guarded internal field-focus operation. Commands may
 change the internal category, clear a search, select a record, open its editor,
 and dispatch its semantic Save/Delete actions in an already unlocked window.
@@ -48,7 +48,8 @@ reliably established. The advertised search Confirm action was also refused in a
 background trial. In a separate self-owned SwiftUI fixture, successful AXValue
 and AXConfirm returned without updating the real Binding model. That experiment
 does not certify Apple operations.
-Readiness reports distinguish lock, editor, unsupported and incomplete views;
+Readiness reports distinguish editor, unavailable and incomplete views;
+an unavailable context does not establish locking from text such as `unlock`.
 static detail labels are not classified as editable fields. Each request obtains
 a fresh owner lease; transient invalid UI frames are discarded rather than
 poisoning a later complete observation. NotesField accepts the actually observed
@@ -205,13 +206,20 @@ apw batch run --apply --plan /private/directory/plan.json \
 ```
 
 An exclusive journal lock prevents two writers. Intent is fsynced before every
-mutation, completion only after exact readback. Interrupted/unknown operations
-resume read-only: the command verifies the expected after-state or stops for
+mutation, completion only after exact readback. Before a notes mutation, the
+complete original state is also saved and fsynced in a new 0600 snapshot named
+`<journal>.<operation-id>.before.json` inside the same private directory. This
+snapshot contains plaintext secret fields; keep it local alongside the journal.
+Interrupted/unknown operations resume read-only: the command binds that full
+snapshot to the original plan's before hash, reconstructs the sole permitted
+after-state with the planned notes, and verifies every field or stops for
 review. It never resends a write because a response was lost. Completed entries
 are reverified, not repeated. A dead executor's lock can be reclaimed only for
 the same plan. New intents retain the native title, so readonly deletion recovery
 can handle a native/list title difference. Legacy intents without that metadata
 still require reconstruction to match the original complete hash exactly.
+Legacy notes intents without complete before-snapshot evidence are held for
+review; a matching after hash in an editable journal is insufficient.
 
 An operator can explicitly resolve a failed, unchanged operation with a read-only
 review. It checks the entire original state before permitting a later dispatch:
@@ -222,6 +230,37 @@ apw batch review --plan /private/directory/plan.json \
 ```
 
 Review never mutates Apple records. A changed or unreadable state remains held.
+
+## Narrow synthetic notes-input experiment
+
+`item test-notes-input` is separate from `notes set` and batch execution. It
+cannot edit customer records or authorize event input for ordinary maintenance.
+It accepts only the exact existing fixture titles `apw API 测试 · SSO 与备注`
+and `apw API 测试 · 独立备注`, their complete hash-verified private original
+state, empty credentials, `.invalid` identities/sites, and unshared placement.
+The replacement text must preserve the entire original UTF-16 prefix and append
+a bounded `APW_FOREGROUND_INPUT_SYNTHETIC_V1` test marker.
+
+```sh
+apw item test-notes-input --foreground-synthetic \
+  --snapshot /private/directory/original-synthetic-snapshot.json \
+  --notes-file /private/directory/complete-synthetic-notes.txt \
+  --journal /private/directory/new-synthetic-attempt.jsonl
+```
+
+Passwords must already be in front. The helper never activates it, changes the
+clipboard, requests permissions, or posts global input. It proves exact item,
+window, field focus and selection before at most four PID-addressed events.
+After an attempted input, any failure leaves the editor for review. A single
+semantic Save must be followed by independent complete persisted readback and
+safe closure before the command acknowledges success. The new private journal
+records fsynced intent first; any existing journal is refused, including a
+failed or completed attempt. No automatic retry or resume exists for this test.
+
+The actual self-owned SwiftUI fixture passed Unicode Binding and persisted
+readback; this does not certify Apple. Apple notes persistence and recoverable
+deletion remain separate unfinished acceptance gates. See the
+[failure specification](native-synthetic-notes-input-failure-spec.md).
 
 Do not retire the source manager until field coverage, passkey identity,
 attachments and sharing/group checks all pass independently.

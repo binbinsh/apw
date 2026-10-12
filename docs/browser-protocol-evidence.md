@@ -15,7 +15,7 @@ REA is useful for further static call-graph and Objective-C/Swift analysis. It d
 - Installed helper: `/System/Cryptexes/App/System/Library/CoreServices/PasswordManagerBrowserExtensionHelper.app/Contents/MacOS/PasswordManagerBrowserExtensionHelper`.
 - Helper whole-file SHA-256: `adad3611bbb8456715849c8cc05bb8e3ac30bfa5150bf3937db596eb089ebb3a`.
 - Binary is universal: x86_64, arm64e, arm64e.x1. Addresses below are the arm64e slice.
-- Installed extension examined: `/Users/binbinsh/.apw/extension/background.js`, bounded static string/command extraction only; SHA-256 `8123953b217f8b03cae386dacb59bf082c604437b2735627193fb7e7a724de16`.
+- Installed extension examined: `$HOME/.apw/extension/background.js`, bounded static string/command extraction only; SHA-256 `8123953b217f8b03cae386dacb59bf082c604437b2735627193fb7e7a724de16`.
 
 The exact disassembly command used was:
 

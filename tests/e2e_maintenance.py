@@ -99,6 +99,8 @@ for line in sys.stdin:
         call('item','notes','set','--apply','--plan',str(f),'--journal',str(j))
         s=json.loads(statefile.read_text())
         check('notes updated in place, all other fields preserved', s['active'][0]=={**keeper,'notes':merge()['notes']} and len(s['active'])==2 and s['writes']==1)
+        intent=json.loads(j.read_text().splitlines()[0]); before_path=pathlib.Path(intent.get('before_snapshot_path','/nonexistent-synthetic-preimage'))
+        check('notes intent binds a private complete before snapshot to the plan',before_path.exists() and before_path.stat().st_mode&0o077==0 and json.loads(before_path.read_text())=={'format':'apw-item-snapshot-v1','sha256':sha(keeper),'state':keeper})
         reset(); bad=cleanup(); bad['before_sha256']='0'*64; f=plan(bad)
         call('batch','run','--apply','--plan',str(f),'--journal',str(journal('changed')),ok=False)
         check('changed preimage blocks deletion',json.loads(statefile.read_text())['writes']==0)

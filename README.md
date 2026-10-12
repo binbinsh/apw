@@ -1,4 +1,5 @@
-> **Experimental GPL maintenance fork:** `codex/batch-maintenance` implements native notes editing,
+> **Experimental GPL maintenance fork:** maintained at [gridheap/apw](https://github.com/gridheap/apw),
+> based on [bendews/apw](https://github.com/bendews/apw). `codex/batch-maintenance` implements native notes editing,
 > recoverable redundant-note deletion, targeted batch inspection, and journaled
 > execution/resume. These functions use a macOS Accessibility helper; they do not
 > provide a public whole-vault Apple API. Live write verification is separate from
@@ -15,6 +16,12 @@
 > An explicit `item probe-notes --foreground-focus` mode tests field capabilities
 > only when the person has already put Passwords in front. It does not activate
 > the app, write text, save or delete, and has not yet passed live acceptance.
+> `item test-notes-input --foreground-synthetic` is a separate one-shot experiment
+> for two exact pre-existing synthetic fixtures. It requires a private original
+> snapshot, append-only test notes and a new fsynced journal. Its PID-addressed
+> input is unavailable to ordinary maintenance commands. A self-owned SwiftUI
+> fixture passed Binding/persisted-readback tests; Apple persistence remains
+> unverified. See [the native experiment contract](docs/native-synthetic-notes-input-failure-spec.md).
 > [Browser protocol and REA evidence](docs/browser-protocol-evidence.md) records
 > the actual parsed fields and action dispatch; passkey and shared-group CRUD
 > are not implemented by the browser channel.
@@ -212,5 +219,5 @@ Distributed under the GPL V3.0 License. See `LICENSE` for more information.
 [issues-shield]: https://img.shields.io/github/issues/bendews/apw.svg?style=for-the-badge
 [issues-url]: https://github.com/bendews/apw/issues
 [license-shield]: https://img.shields.io/github/license/bendews/apw.svg?style=for-the-badge
-[license-url]: https://github.com/binbinsh/apw/blob/codex/batch-maintenance/LICENSE
+[license-url]: https://github.com/gridheap/apw/blob/codex/batch-maintenance/LICENSE
 [product-screenshot]: images/screenshot.png

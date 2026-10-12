@@ -117,6 +117,8 @@ for line in sys.stdin:
             plan, journal, after, note = prepare("composed-success")
             result = run(plan, journal)
             check("append then delete completes using post-merge keeper hash", result.returncode == 0 and json.loads(result.stdout)["completed"] == 2)
+            intent=json.loads(journal.read_text().splitlines()[0]); preimage=pathlib.Path(intent.get("before_snapshot_path","/nonexistent-synthetic-preimage"))
+            check("composed notes intent retains complete private original keeper proof", preimage.exists() and preimage.stat().st_mode & 0o077 == 0 and json.loads(preimage.read_text()) == {"format":"apw-item-snapshot-v1","sha256":sha(keeper),"state":keeper})
             value = current()
             check("keeper complete state preserved and candidate recoverably deleted", value["active"] == [after] and value["deleted"] == [note] and value["writes"] == ["notes-set", "delete-redundant-note"])
             result = run(plan, journal)

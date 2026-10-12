@@ -242,6 +242,12 @@ export class ApplePasswordManager {
         try { return passwordHost(site).replace(/^www\./, "") === requestedHost; }
         catch { return false; }
       }));
+    // A matching identity does not prove its password was returned. Preserve
+    // explicit empty strings, but never present absent/null/metadata values as
+    // successful password reads or silently replace them with an empty value.
+    if (payload.Entries.some((e) => !("PWD" in e) || typeof e.PWD !== "string" || e.PWD === "Not Included")) {
+      throw new APWError(Status.SERVER_ERROR, "apple_password_value_unavailable");
+    }
     return payload;
   }
 

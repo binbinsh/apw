@@ -16,8 +16,10 @@ verified against Apple's signed Passwords process. They do not bypass unlocking,
 activate the application, set focus, or generate keyboard/mouse events. They may
 change the internal category, clear a search, select a record, open its editor,
 and dispatch its semantic Save/Delete actions in an already unlocked window.
-Only one complete list index is constructed per category/generation. A fresh row
-must still match that index; a mismatch fails closed.
+Active lookup replaces the search field's complete selected text and verifies
+the new query and at most 100 fresh result rows. No complete active-library scan
+is used. A fresh result model and selected row must match the bounded index; a
+mismatch fails closed. Recently Deleted is indexed separately.
 
 Touch ID and app unlocking require the person. Locked/unsupported windows stop
 the command. `item doctor` reports actual local access/window availability;
@@ -31,9 +33,13 @@ exact reads and exposed an Apple editor behavior: AXValue updates the visible
 NotesField but does not persist its model. The replacement implementation uses
 complete AXSelectedText replacement with exact UTF-16 range and unchanged global
 focus checks. This new live write path and recoverable deletion still need a
-successful Apple synthetic trial; customer cleanup remains held. A later native
-index read was incomplete and stopped before a mutation. Do not treat the mock
-E2E as an Apple mutation acceptance result.
+successful Apple synthetic trial; customer cleanup remains held. A later complete
+native index read was incomplete and stopped before a mutation. Bounded search
+now avoids that scan. The advertised search Confirm action was refused in a
+background trial; complete selected-text replacement still needs live acceptance.
+Readiness reports distinguish lock, editor, unsupported and incomplete views;
+static detail labels are not classified as editable fields. Do not treat mock
+E2E or read-only diagnostics as an Apple mutation acceptance result.
 
 ## Build and repeatable tests
 
@@ -54,6 +60,11 @@ specific already imported synthetic fixtures named in that script. It never
 creates/imports a record or activates/unlocks Passwords. Do not run again after
 intent without reviewing its saved trial directory and journal. Customer data
 must wait until the synthetic trial passes.
+
+`tests/e2e_apple_resume.py` resumes that same saved trial and journal; it cannot
+create a fresh plan or target customer identities. `--review-unchanged` first
+performs the explicit read-only preimage review. A failed read/review stops before
+any new write. Its report stores every exact CLI invocation.
 
 ## Private targeted snapshots
 

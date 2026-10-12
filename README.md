@@ -1,8 +1,10 @@
-> **GPL maintenance fork:** `codex/batch-maintenance` adds exact native notes editing,
+> **Experimental GPL maintenance fork:** `codex/batch-maintenance` implements native notes editing,
 > recoverable redundant-note deletion, targeted batch inspection, and journaled
 > execution/resume. These functions use a macOS Accessibility helper; they do not
 > provide a public whole-vault Apple API. Live write verification is separate from
-> the synthetic CLI tests. See [maintenance usage and limits](docs/maintenance.md).
+> the synthetic CLI tests. Live Apple notes save/deletion has **not passed**;
+> do not apply maintenance plans to real credentials yet.
+> See [maintenance usage and limits](docs/maintenance.md).
 
 <div align="center">
   <a href="https://github.com/bendews/apw">
@@ -26,7 +28,7 @@
 
 [![Contributors][contributors-shield]][contributors-url] [![Forks][forks-shield]][forks-url]
 [![Stargazers][stars-shield]][stars-url] [![Issues][issues-shield]][issues-url]
-[![MIT License][license-shield]][license-url]
+[![GPL License][license-shield]][license-url]
 <br />
 
 </div>
@@ -197,5 +199,5 @@ Distributed under the GPL V3.0 License. See `LICENSE` for more information.
 [issues-shield]: https://img.shields.io/github/issues/bendews/apw.svg?style=for-the-badge
 [issues-url]: https://github.com/bendews/apw/issues
 [license-shield]: https://img.shields.io/github/license/bendews/apw.svg?style=for-the-badge
-[license-url]: https://github.com/bendews/apw/blob/master/LICENSE.txt
+[license-url]: https://github.com/binbinsh/apw/blob/codex/batch-maintenance/LICENSE
 [product-screenshot]: images/screenshot.png

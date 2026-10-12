@@ -31,3 +31,8 @@ Fail closed when:
 
 No native read/write may print secrets to stdout or copy them to the clipboard.
 Snapshots/plans are temporary private files, not an additional credential vault.
+
+Readiness diagnostics must distinguish a locked window, an already open editor,
+an unsupported window and incomplete Accessibility observations. They may expose
+only structure, standard action names and attribute writability, never field
+values. An open user editor must not be cancelled to make a diagnostic succeed.

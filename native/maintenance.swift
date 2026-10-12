@@ -102,6 +102,7 @@ var backgroundOwnerPID:pid_t?
 var refreshActiveSearchModel=false
 var scanActiveList=true
 var indexedLabels:[[String]]?
+var boundQuery=""
 var backgroundUnsafeFocusObserved=false
 func attr(_ n:AXUIElement,_ k:String)->CFTypeRef? {
  guard Date()<deadline else{return nil};var v:CFTypeRef?
@@ -167,8 +168,10 @@ func scriptOwnerGuard(_ expression:String)->String {
 }
 func owned(_ n:AXUIElement)->Bool {var pid:pid_t=0;return front() && AXUIElementGetPid(n,&pid) == .success && pid==appPID}
 func set(_ n:AXUIElement,_ k:String,_ v:CFTypeRef)->Bool {
- let notesSelection=[kAXSelectedTextAttribute,kAXSelectedTextRangeAttribute].contains(k) && text(n,kAXIdentifierAttribute)=="NotesField" && text(n,kAXRoleAttribute)=="AXTextArea"
- guard k != kAXFocusedAttribute,!(backgroundOwnerPID != nil && [kAXSelectedTextAttribute,kAXSelectedTextRangeAttribute].contains(k) && !notesSelection),owned(n) else{report["ui_set_foreground_gate_refused"]=true;return false}
+ let textSelection=[kAXSelectedTextAttribute,kAXSelectedTextRangeAttribute].contains(k) &&
+  ((text(n,kAXIdentifierAttribute)=="NotesField" && text(n,kAXRoleAttribute)=="AXTextArea") ||
+   (text(n,kAXSubroleAttribute)=="AXSearchField" && text(n,kAXRoleAttribute)=="AXTextField"))
+ guard k != kAXFocusedAttribute,!(backgroundOwnerPID != nil && [kAXSelectedTextAttribute,kAXSelectedTextRangeAttribute].contains(k) && !textSelection),owned(n) else{report["ui_set_foreground_gate_refused"]=true;return false}
  let result=AXUIElementSetAttributeValue(n,k as CFString,v)
  if result != .success {report["ui_set_attribute"]=k;report["ui_set_error_code"]=result.rawValue}
  return result == .success
@@ -327,7 +330,7 @@ func context(_ root:AXUIElement)->(AXUIElement,AXUIElement)? {
  let lists=all.filter{["AXOutline","AXTable"].contains(text($0,kAXRoleAttribute)) && text($0,kAXIdentifierAttribute)=="AccountListView"}
  return f.count==1 && lists.count==1 ? (f[0],lists[0]):nil
 }
-func query(_ previous:AXUIElement,_ q:String)->Bool { context(AXUIElementCreateApplication(appPID)).map { text($0.0,kAXValueAttribute).isEmpty } ?? false }
+func query(_ previous:AXUIElement,_ q:String)->Bool { context(AXUIElementCreateApplication(appPID)).map { text($0.0,kAXValueAttribute)==boundQuery } ?? false }
 func fields(_ ns:[AXUIElement])->[String:String] {
  var result:[String:String]=[:]
  for id in ["TitleField","UserNameField","PasswordField","NotesField","WebsiteField","VerificationCodeField"] {
@@ -405,13 +408,13 @@ func read(_ root:AXUIElement,_ t:Target,leaveOpen:Bool=false)->NativeRead? {
  defer{phase("read_ended")}
  guard let (f,_)=context(root) else {report["failure_stage"]="search_context";return nil}
  phase("search_context")
- let searchQuery=""
+ let searchQuery=boundQuery
  report["search_identity_kind"]=t.urls.isEmpty ? (searchQuery==t.title ? "exact_title":"bound_companion_title_token"):"bound_website_host"
  guard query(f,searchQuery) else{report["failure_stage"]="single_query_edit";return nil}
  // Filtering may replace the outline object. Reacquire its current model;
  // never use the pre-query AXRows reference as an identity or delete target.
  var observed:[AXUIElement]?,observedLabels:[[String]]?
- let rowLimit=3000
+ let rowLimit=100
  if let (_,fresh)=context(root),let rows=attr(fresh,kAXRowsAttribute) as? [AXUIElement],let labels=indexedLabels,rows.count==labels.count {
   observed=rows;observedLabels=labels
  }
@@ -784,7 +787,25 @@ func boundedClick(_ node:AXUIElement,_ root:AXUIElement)->Bool {
  if p.isRunning {p.terminate();return false}
  return p.terminationStatus==0 && front() && String(data:output.fileHandleForReading.readDataToEndOfFile(),encoding:.utf8)?.trimmingCharacters(in:.whitespacesAndNewlines)=="clicked"
 }
-func selectCategory(_ root:AXUIElement,_ category:String)throws {
+func submitQuery(_ root:AXUIElement,_ wanted:String)throws {
+ guard let (f,_)=context(root) else{throw nativeFailure("locked_or_user_editor")}
+ let owner=NSWorkspace.shared.frontmostApplication?.processIdentifier,keyboard=focusPID()
+ var wr=DarwinBoolean(false),wt=DarwinBoolean(false)
+ try require(AXUIElementIsAttributeSettable(f,kAXSelectedTextRangeAttribute as CFString,&wr) == .success && wr.boolValue &&
+  AXUIElementIsAttributeSettable(f,kAXSelectedTextAttribute as CFString,&wt) == .success && wt.boolValue,"search_text_replacement_unsupported")
+ // AXValue can change a visible field without changing its saved model;
+ // Confirm is advertised by NSSearchField but refused in the live background
+ // trial. Replace the complete addressed text, without focusing or key events.
+ var full=CFRange(location:0,length:text(f,kAXValueAttribute).utf16.count)
+ guard let range=AXValueCreate(.cfRange,&full),set(f,kAXSelectedTextRangeAttribute,range),let seen=attr(f,kAXSelectedTextRangeAttribute),CFGetTypeID(seen)==AXValueGetTypeID() else{throw nativeFailure("search_selection_unverified")}
+ var actual=CFRange();try require(AXValueGetValue(unsafeBitCast(seen,to:AXValue.self),.cfRange,&actual) && actual.location==0 && actual.length==full.length,"search_selection_unverified")
+ try require(set(f,kAXSelectedTextAttribute,wanted as CFString),"search_text_replacement_refused")
+ pause(0.1)
+ try require(NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard && front(),"search_owner_changed")
+ guard let (fresh,_) = context(root),text(fresh,kAXValueAttribute)==wanted else{throw nativeFailure("search_value_changed")}
+ boundQuery=wanted;indexedLabels=nil
+}
+func selectCategory(_ root:AXUIElement,_ category:String,buildIndex:Bool=true)throws {
  guard let (f,_)=context(root) else{throw nativeFailure("locked_or_user_editor")}
  if currentCategory.isEmpty,!text(f,kAXValueAttribute).isEmpty {
   // Clear with the actual search cancel action, not an AXValue write that
@@ -793,13 +814,18 @@ func selectCategory(_ root:AXUIElement,_ category:String)throws {
   currentCategory="active"
  }
  guard let (currentSearch,_)=context(root) else{throw nativeFailure("locked_or_user_editor")}
- try require(text(currentSearch,kAXValueAttribute).isEmpty,"filtered_list_refused")
+ if currentCategory != category,!text(currentSearch,kAXValueAttribute).isEmpty {
+  try require(clearAllListBridge(root),"list_preparation_failed");currentCategory="active";boundQuery=""
+ }
  if currentCategory != category {
   let names=category=="active" ? ["全部","All"]:["已删除","Deleted","Recently Deleted","最近删除"]
   guard let b=categoryButton(root,names) else{throw nativeFailure("category_ambiguous")}
   try require(boundedClick(b,root),"category_selection_failed")
   pause(0.15);currentCategory=category
  }
+ if !buildIndex {return}
+ try require(context(root).map{text($0.0,kAXValueAttribute).isEmpty} ?? false,"filtered_list_refused")
+ boundQuery=""
  guard let (_,list)=context(root),let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=3000 else{throw nativeFailure("list_unavailable")}
  let cached=category=="active" ? activeLabels:deletedLabels
  if let cached {
@@ -821,8 +847,24 @@ func snapshot(_ key:[String:String],_ n:NativeRead)throws->[String:Any] {
   "otp":n.otpAbsent ? "absent":"unknown","passkey":n.passkeyAbsent ? "absent":"unknown","extra_fields":extra]
 }
 func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=false)throws->(AXUIElement,NativeRead,[String:Any]) {
- let root=try freshRoot();try selectCategory(root,category)
- guard let title=key["title"],!title.isEmpty,let user=key["username"],let labels=indexedLabels else{throw nativeFailure("identity_invalid")}
+ let root=try freshRoot();try selectCategory(root,category,buildIndex:false)
+ guard let title=key["title"],!title.isEmpty,let user=key["username"] else{throw nativeFailure("identity_invalid")}
+ try submitQuery(root,title)
+ let until=Date(timeIntervalSinceNow:4);var labels:[[String]]?
+ while front(),Date()<until {
+  if let (search,list)=context(root),text(search,kAXValueAttribute)==title,
+   let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=100,
+   let current=completeDiscovery({rows.map{rowValues($0)}}) {
+   if current.contains(where:{$0.contains(title)}) {labels=current;break}
+   if rows.isEmpty {labels=[]}
+  }
+  pause(0.05)
+ }
+ guard let labels else{throw nativeFailure("bounded_search_unverified")}
+ guard front(),let (freshSearch,freshList)=context(root),text(freshSearch,kAXValueAttribute)==title,
+  let freshRows=attr(freshList,kAXRowsAttribute) as? [AXUIElement],freshRows.count<=100,
+  completeDiscovery({freshRows.map{rowValues($0)}})==labels else{throw nativeFailure("bounded_search_generation_changed")}
+ indexedLabels=labels;activeLabels=labels
  let matches=labels.filter{$0.contains(title) && (user.isEmpty || $0.contains(user))}
  try require(matches.count>0,"item_not_found");try require(matches.count==1,"item_ambiguous")
  let target=Target(title:title,native_title:title,username:user,notes:"",urls:[])
@@ -869,14 +911,37 @@ func execute(_ q:[String:Any])throws->[String:Any] {
  let op=q["op"] as? String ?? ""
  if op=="doctor" {
   let running=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
-  var windowState="unknown"
+  var windowState="access_unavailable",editorCount=0,complete=false
+  var searchShape:[String:Any]=["count":0],structure:[String:Int]=[:],fieldRoles:[String:String]=[:]
   if AXIsProcessTrusted(),running.count==1,apple(running[0].processIdentifier) {
    let ns=nodes(AXUIElementCreateApplication(running[0].processIdentifier))
-   if ns.contains(where:{text($0,kAXIdentifierAttribute)=="AccountListView"}) {windowState="unlocked_list_available"}
-   else if ns.filter({text($0,kAXRoleAttribute)=="AXButton"}).contains(where:{n in values([n]).contains{v in v.contains("解锁") || v.lowercased().contains("unlock")}}) {windowState="locked"}
+   for n in ns {structure[text(n,kAXRoleAttribute),default:0]+=1}
+   for n in ns where ["TitleField","UserNameField","PasswordField","NotesField"].contains(text(n,kAXIdentifierAttribute)) {fieldRoles[text(n,kAXIdentifierAttribute)]=text(n,kAXRoleAttribute)}
+   editorCount=fieldRoles.values.filter{["AXTextField","AXTextArea","AXComboBox"].contains($0)}.count
+   let windows=ns.filter{text($0,kAXSubroleAttribute)=="AXStandardWindow"}
+   let search=ns.filter{text($0,kAXRoleAttribute)=="AXTextField" && text($0,kAXSubroleAttribute)=="AXSearchField"}
+   searchShape["count"]=search.count
+   if search.count==1 {
+    var supported:[String:Bool]=[:]
+    for key in [kAXValueAttribute,kAXSelectedTextAttribute,kAXSelectedTextRangeAttribute] {
+     var writable=DarwinBoolean(false)
+     supported[key]=AXUIElementIsAttributeSettable(search[0],key as CFString,&writable) == .success && writable.boolValue
+    }
+    var actions:CFArray?
+    if AXUIElementCopyActionNames(search[0],&actions) == .success {searchShape["actions"]=actions as? [String] ?? []}
+    searchShape["settable"]=supported
+   }
+   if editorCount>0 {windowState="user_editor_open"}
+   else if ns.contains(where:{text($0,kAXIdentifierAttribute)=="AccountListView"}) && search.count==1 {windowState="unlocked_list_available"}
+   else if values(ns).contains(where:{v in v.contains("已锁定") || v.contains("解锁") || v.lowercased().contains("locked") || v.lowercased().contains("unlock") || v.contains("Touch ID")}) {windowState="locked"}
+   else {windowState=windows.isEmpty ? "no_standard_window":"unsupported_window"}
+   complete = !nativeObservationIncomplete
+   if !complete {windowState="incomplete_window_observation"}
   }
   return ["ok":true,"backend":"apple-passwords-accessibility","capabilities":["read","notes-set","delete-redundant-note"],
    "apple_live_verified":false,"accessibility_trusted":AXIsProcessTrusted(),"apple_running":running.count==1,"window_state":windowState,
+   "window_observation_complete":complete,"editor_field_count":editorCount,"search_field":searchShape,
+   "role_counts":structure,"field_roles":fieldRoles,
    "passwords_frontmost":running.count==1 && NSWorkspace.shared.frontmostApplication?.processIdentifier==running[0].processIdentifier,
    "whole_vault_public_api":false,"native_protocol_delete_assumed":false]
  }

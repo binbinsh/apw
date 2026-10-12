@@ -1,0 +1,16 @@
+# Redundant note deletion when Deleted does not expose its body
+
+The existing full-body path remains unchanged. A new proof is **content preservation**, not proof that Recently Deleted exposes or can recover its complete body. No fallback is permitted for ordinary logins or missing credential/OTP/passkey/sharing/extra-field observations.
+
+Failure list (the specification):
+
+- Only `maintenance_deleted_body_unverified` from the exact Deleted read may select the conservation path. Timeout, ambiguity, invalid reply, refused read, locked window, missing item, and all other errors remain uncertain.
+- The complete candidate preimage must reconstruct to the original plan SHA: empty username/password/sites, absent OTP/passkey, unshared, empty extra fields, nonempty literal `preserve_text`, captured native title, and all source IDs in the preserved body. New deletes fsync a private full candidate snapshot before intent and dispatch; snapshot mismatch/unsafe path holds. Legacy pending operations may use the complete hash-bound reconstructed preimage, but must explicitly report the legacy evidence scope.
+- New deletes attempt a readonly exact Deleted preflight. Existing Deleted identity refuses dispatch. Only an explicit item-not-found establishes absence. Legacy helper `operation_unsupported` may preserve the existing full-body path but cannot enable conservation fallback. Other preflight errors refuse dispatch. A legacy pending journal has no historical absence evidence and must not claim it.
+- `deleted-location-read` must return the exact fixed location schema, `verification=deleted_note_location_only`, `body_verified=false`, no state; category/query/unique current selected row/exact native title/Recover/complete frames/unchanged owner are mandatory, with at least two independent complete frames. It must not pretend the input username was read from Deleted UI.
+- Keeper AFTER is read completely twice, independently. Each whole State SHA equals the original keeper SHA; both states agree, are unshared, contain the candidate entire exact note and every source ID. Equal notes with different passwords, sites, OTP/passkeys, native titles, accounts, sharing or extra fields fail. Truncated or Unicode-normalized text fails.
+- Active exact absence is explicitly checked, then checked again after the first keeper read. Timeout, null, ambiguous, partial-list, or stale read cannot mean absent. No second delete, recovery, save or notes mutation is allowed on a pending/done operation.
+- Any failed proof leaves uncertain and does not replay; completed operations are still verified read-only. A previous `done` flag, sidebar count, source export or preimage alone never counts as keeper AFTER.
+- `done` records the specific verification mode and separately identifies `content_preservation_verified` and `deleted_body_verified`. Public output contains no states, account/notes/password/source IDs. No statement of fully recoverable Deleted content is made by the conservation branch.
+
+E2E uses the actual compiled CLI with an isolated stateful synthetic helper. It proves transport/control/journal behavior, not native Apple functionality. RED command and stored report precede source implementation; root performs the later unified build and GREEN through the same entry point.

@@ -210,6 +210,11 @@ def main():
             reply = run("unavailable-status", {"status": "unavailable", "notes": SECRET})
             check("known unavailable context classification survives without free text", reply.get("diagnostics") == {"status": "unavailable"})
 
+            recovery_variants = [("search_clear_method", value) for value in ["addressed_semantic_clear", "addressed_value_then_semantic_clear", "addressed_value_cycle"]] + [("search_clear_failure", value) for value in ["clear_binding_unverified", "clear_value_submission_failed"]]
+            for field, value in recovery_variants:
+                reply = run("bounded-clear-recovery-" + value, {field:value})
+                check("known bounded recovery diagnostic " + value + " survives", reply.get("diagnostics") == {field:value})
+
             valid_frame = SAFE["search_model_frames"][0]
             invalid_frames = [
                 SECRET, {"notes":SECRET}, [valid_frame]*17,
@@ -239,7 +244,7 @@ def main():
                 reply=run("malformed-search-frame-counts-"+str(index),{"search_model_frame_counts":bad_counts})
                 check("malformed search frame counts "+str(index)+" are refused",reply.get("diagnostics",{})=={})
             records = [json.loads(line) for line in calls.read_text().splitlines()]
-            check("one failing native read per invocation, without retry", records == [{"op":"read"}]*(3+len(invalid_frames)+len(invalid_counts)))
+            check("one failing native read per invocation, without retry", records == [{"op":"read"}]*(3+len(recovery_variants)+len(invalid_frames)+len(invalid_counts)))
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
 

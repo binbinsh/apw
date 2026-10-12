@@ -158,7 +158,8 @@ const batchRun = () => new Command()
   .option("--plan <path:string>", "Private hash-bound JSON plan.", { required: true })
   .option("--journal <path:string>", "Private fsynced checkpoint journal.", { required: true })
   .option("--apply", "Execute once; default only validates without native calls.")
-  .action(async (o: { plan: string; journal: string; apply?: boolean }) => await runBatch(o.plan,o.journal,o.apply === true));
+  .option("--skip-completed", "Reuse qualified done checkpoints without current Apple reads; uncertain operations are still verified read-only.")
+  .action(async (o: { plan: string; journal: string; apply?: boolean; skipCompleted?:boolean }) => await runBatch(o.plan,o.journal,o.apply === true,undefined,false,o.skipCompleted === true));
 const batch = new Command().description("Recoverable, resumable maintenance batches.")
   .command("run", batchRun())
   .command("review",new Command().description("Read-only resolution of uncertain operations whose complete before-state is unchanged.")
@@ -172,7 +173,8 @@ const batch = new Command().description("Recoverable, resumable maintenance batc
   .command("inspect", new Command().description("Read at most 50 named items using one native list index; no whole-vault export.")
     .option("--targets <path:string>", "Private explicit target list.", {required:true})
     .option("--output <path:string>", "New private snapshot file.", {required:true})
-    .action(async (o:{targets:string;output:string}) => await inspectItems(o.targets,o.output)));
+    .option("--save-partial", "On the first error, save only completed verified snapshots and stop with a nonzero exit; never continue or retry.")
+    .action(async (o:{targets:string;output:string;savePartial?:boolean}) => await inspectItems(o.targets,o.output,o.savePartial === true)));
 const item = new Command().description("Exact native item/notes maintenance; never activates an app.")
   .command("test-notes-input", new Command().description("One journaled notes-input trial on two exact pre-existing synthetic fixtures; Passwords must already be foreground.")
     .option("--snapshot <path:string>", "Private hash-verified original synthetic snapshot.", {required:true})

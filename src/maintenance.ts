@@ -8,8 +8,11 @@ type State = { key: Key; native_title: string; notes: string; password: string; 
   sharing: string; otp: string; passkey: string; extra_fields: unknown[] };
 type Operation = { id: string; kind: "notes-set" | "delete-redundant-note"; target: Key; before_sha256: string;
   notes?: string; keeper?: { target: Key; before_sha256: string }; preserve_text?: string; source_ids?: string[] };
+type DeletionProof = { deletion_verification: "full_deleted_body" | "content_preservation_deleted_location" | "legacy_pending_content_preservation_deleted_location";
+  content_preservation_verified: true; deleted_body_verified: boolean };
 type Entry = { plan: string; id: string; event: string; after_sha256?: string; before_sha256?: string; before_native_title?: string;
-  before_snapshot_path?: string; at: string };
+  before_snapshot_path?: string; deleted_preflight_absent?: boolean; deletion_verification?: DeletionProof["deletion_verification"];
+  content_preservation_verified?: boolean; deleted_body_verified?: boolean; at: string };
 const encoder = new TextEncoder();
 const fail = (code: string): never => { throw new APWError(Status.INVALID_PARAM, "maintenance_" + code); };
 // Backend diagnostics cross the public stderr boundary. Never forward arbitrary
@@ -31,8 +34,8 @@ function safeDiagnostics(value: unknown): Record<string, unknown> {
     search_witness_failure: ["maintenance_search_baseline_unverified", "maintenance_search_value_unsupported", "maintenance_search_value_refused",
       "maintenance_search_empty_witness_unverified", "maintenance_search_context_changed", "maintenance_search_target_model_unverified",
       "maintenance_search_observation_incomplete"],
-    search_clear_failure: ["clear_button_ambiguous", "clear_action_refused", "clear_model_unverified", "clear_capability_incomplete", "clear_text_submission_failed"],
-    search_clear_method: ["addressed_cancel_button", "addressed_selected_text"],
+    search_clear_failure: ["clear_button_ambiguous", "clear_action_refused", "clear_model_unverified", "clear_capability_incomplete", "clear_text_submission_failed", "clear_binding_unverified", "clear_value_submission_failed"],
+    search_clear_method: ["addressed_cancel_button", "addressed_selected_text", "addressed_semantic_clear", "addressed_value_then_semantic_clear", "addressed_value_cycle"],
     bounded_click_bridge_failure: ["owner_changed", "process_changed", "window_changed", "sheet_changed", "role_changed", "identity_changed",
       "caption_changed", "none", "unclassified_system_events_error"],
     confirmation_bridge_failure: ["editor_address_unavailable", "owner_changed", "process_changed", "window_changed", "sheet_changed",
@@ -287,7 +290,7 @@ export async function readItem(title: string, username: string, output: string):
     console.log(JSON.stringify({ read: true, private_output: output, sha256: await hash(value), app_activated: false }));
   } finally { await native?.close(); file.close(); }
 }
-export async function inspectItems(targetsPath: string, output: string): Promise<void> {
+export async function inspectItems(targetsPath: string, output: string, savePartial = false): Promise<void> {
   let plan: { format:string; targets:Key[] };
   try { plan=JSON.parse(new TextDecoder("utf-8", {fatal:true}).decode(await privateBytes(targetsPath))); } catch { fail("targets_invalid"); }
   if (plan!.format !== "apw-maintenance-targets-v1" || !Array.isArray(plan!.targets) || !plan!.targets.length ||
@@ -298,7 +301,25 @@ export async function inspectItems(targetsPath: string, output: string): Promise
   try {
     const reserved=await file.stat(); await verifySnapshotOutput(file,output,reserved);
     native=new Native(); const items=[];
-    for (const target of plan!.targets) { const value=await native.read(target); items.push({state:value,sha256:await hash(value)}); }
+    for (let index=0; index<plan!.targets.length; index++) {
+      try {
+        const value=await native.read(plan!.targets[index]);items.push({state:value,sha256:await hash(value)});
+      } catch (e) {
+        const error=e instanceof APWError ? e : undefined;
+        const code=error && /^maintenance_[a-z_]+$/.test(error.message) ? error.message : "maintenance_inspection_failed";
+        // Opt-in salvage stops at the first failure, including a helper timeout
+        // or an unclosed editor. It grants no continuation/recovery authority.
+        // Only complete state()-validated, hash-bound prefix items are saved.
+        if (savePartial) {
+          await writeSnapshot(file,output,reserved,encoder.encode(JSON.stringify({format:"apw-item-snapshots-v1",complete:false,
+            requested_count:plan!.targets.length,failed_index:index+1,items,failures:[{index:index+1,error:code}]})+"\n"));
+        }
+        // The cleartext prefix stays private; public diagnostics contain only
+        // filtered structural evidence, local positions and the fsynced status.
+        throw new APWError(error?.status ?? Status.GENERIC_ERROR,
+          code,{...safeDiagnostics(error?.diagnostics),target_index:index+1,completed_reads:items.length,...(savePartial ? {partial_saved:true}:{})});
+      }
+    }
     await writeSnapshot(file,output,reserved,encoder.encode(JSON.stringify({format:"apw-item-snapshots-v1",items})+"\n"));
     console.log(JSON.stringify({read:true,count:items.length,private_output:output,app_activated:false}));
   } finally {await native?.close();file.close();}
@@ -412,7 +433,55 @@ export async function syntheticForegroundNotesInput(snapshotPath: string, notesF
     } catch (e) {await append("uncertain");throw e;}
   } finally {await native?.close();file!.close();}
 }
-export async function runBatch(planPath: string, journalPath: string, apply: boolean, onlyKind?: Operation["kind"], review=false): Promise<void> {
+async function exactActiveAbsence(native: Native, target: Key): Promise<void> {
+  try { await native.read(target); }
+  catch (e) { if (e instanceof APWError && e.message === "maintenance_item_not_found") return; throw e; }
+  fail("deletion_unverified");
+}
+async function completePreservedKeeper(native: Native, o: Operation, before: State): Promise<State> {
+  const keeper = await native.read(o.keeper!.target);
+  if (await hash(keeper) !== o.keeper!.before_sha256 || keeper.sharing !== "unshared" ||
+      !keeper.notes.includes(before.notes) || o.source_ids!.some(id => !keeper.notes.includes(id))) fail("keeper_proof_refused");
+  return keeper;
+}
+async function verifyRedundantDeletion(native: Native, o: Operation, before: State, preflightAbsent: boolean | undefined): Promise<DeletionProof> {
+  // This branch is limited to a complete, hash-bound empty-credential note.
+  // It cannot be a general fallback for an ordinary login or a partial read.
+  if (await hash(before) !== o.before_sha256 || before.password !== "" || before.key.username !== "" || before.sites.length ||
+      before.otp !== "absent" || before.passkey !== "absent" || before.sharing !== "unshared" || before.extra_fields.length ||
+      !before.notes || before.notes !== o.preserve_text || o.source_ids!.some(id => !before.notes.includes(id))) fail("redundant_note_proof_refused");
+  try {
+    if (await hash(await native.read(o.target, true, before)) !== o.before_sha256) fail("deletion_unverified");
+  } catch (e) {
+    // A timeout/invalid/ambiguous/refused reply must never become evidence that
+    // Apple merely hides the body. Only this precise successful-frame failure
+    // may request the separate, location-only native observation.
+    if (!(e instanceof APWError) || e.message !== "maintenance_deleted_body_unverified") throw e;
+    // An unsupported preflight on a new delete preserves legacy full-body
+    // compatibility, but never permits the weaker historical identity scope.
+    if (preflightAbsent === false) fail("outcome_requires_review");
+    await exactActiveAbsence(native, o.target);
+    const result = await native.call("deleted-location-read", {key:o.target, expected:before});
+    const location = result.location as Record<string,unknown> | undefined;
+    if (result.verification !== "deleted_note_location_only" || result.body_verified !== false || Object.hasOwn(result,"state") ||
+        !location || typeof location !== "object" || Array.isArray(location) ||
+        Object.keys(location).sort().join() !== "category,frame_complete,key,native_title,owner_unchanged,query_empty,recovery_unique,selected_exact,stable_complete_frames,title_matches" ||
+        location.category !== "deleted" || canonical(location.key) !== canonical(o.target) || location.native_title !== before.native_title ||
+        [location.selected_exact,location.title_matches,location.recovery_unique,location.frame_complete,location.query_empty,location.owner_unchanged].some(x => x !== true) ||
+        typeof location.stable_complete_frames !== "number" || !Number.isInteger(location.stable_complete_frames) ||
+        location.stable_complete_frames < 2 || location.stable_complete_frames > 3000) fail("deleted_location_unverified");
+    const first = await completePreservedKeeper(native, o, before);
+    await exactActiveAbsence(native, o.target);
+    const second = await completePreservedKeeper(native, o, before);
+    if (canonical(first) !== canonical(second)) fail("keeper_proof_refused");
+    return {deletion_verification:preflightAbsent === true ? "content_preservation_deleted_location" : "legacy_pending_content_preservation_deleted_location",
+      content_preservation_verified:true, deleted_body_verified:false};
+  }
+  await exactActiveAbsence(native, o.target);
+  await completePreservedKeeper(native, o, before);
+  return {deletion_verification:"full_deleted_body",content_preservation_verified:true,deleted_body_verified:true};
+}
+export async function runBatch(planPath: string, journalPath: string, apply: boolean, onlyKind?: Operation["kind"], review=false, skipCompleted=false): Promise<void> {
   const bytes = await privateBytes(planPath);
   let raw: unknown; try { raw = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)); } catch { fail("plan_invalid"); }
   const operations = validate(raw), planHash = await hash(raw);
@@ -435,7 +504,7 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
     await Deno.mkdir(lock, { mode: 0o700 });
   }
   let file: Deno.FsFile | undefined, native: Native | undefined;
-  let completed = 0, mutations = 0, reviewed=0;
+  let completed = 0, mutations = 0, reviewed=0, skippedCompleted=0, contentPreservationVerifications=0, deletedBodyVerifications=0;
   try {
     const owner = await Deno.open(lock + "/owner.json", { createNew: true, write: true, mode: 0o600 });
     try { await writeAll(owner, encoder.encode(JSON.stringify({ pid: Deno.pid, plan: planHash }))); } finally { owner.close(); }
@@ -451,12 +520,16 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
       file = await Deno.open(journalPath, { createNew: true, write: true, mode: 0o600 });
     }
     const opened = await file!.stat(), pathNow = await Deno.lstat(journalPath);
-    if (!opened.isFile || opened.uid !== Deno.uid() || (opened.mode! & 0o077) || pathNow.isSymlink || pathNow.ino !== opened.ino) fail("journal_unsafe");
-    const append = async (o: Operation, event: string, after?: string, beforeNativeTitle?: string, beforeSnapshotPath?: string) => {
+    if (!opened.isFile || opened.uid !== Deno.uid() || (opened.mode! & 0o077) || pathNow.isSymlink || pathNow.ino !== opened.ino ||
+        (skipCompleted && (opened.nlink!==1 || pathNow.nlink!==1 || pathNow.dev!==opened.dev))) fail("journal_unsafe");
+    const append = async (o: Operation, event: string, after?: string, beforeNativeTitle?: string, beforeSnapshotPath?: string,
+        deletionProof?: DeletionProof, deletedPreflightAbsent?: boolean) => {
       const entry: Entry = { plan: planHash, id: o.id, event, before_sha256: o.before_sha256,
         ...(after ? { after_sha256: after } : {}),
         ...(event === "intent" && beforeNativeTitle !== undefined ? { before_native_title: beforeNativeTitle } : {}), at: new Date().toISOString() };
       if (event==="intent" && beforeSnapshotPath!==undefined) entry.before_snapshot_path=beforeSnapshotPath;
+      if (event==="intent" && deletedPreflightAbsent!==undefined) entry.deleted_preflight_absent=deletedPreflightAbsent;
+      if (event==="done" && deletionProof) Object.assign(entry,deletionProof);
       await writeAll(file!, encoder.encode(JSON.stringify(entry) + "\n")); history.push(entry);
     };
     native = new Native();
@@ -468,7 +541,21 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
           (o.keeper && await hash(await native.read(o.keeper.target))!==o.keeper.before_sha256)) fail("review_preimage_changed");
         await append(o,"reviewed-no-change");reviewed++;continue;
       }
-      // Every completed/uncertain operation is verified read-only. Never replay intent.
+      // Only modern, internally consistent checkpoint chains may avoid current
+      // reads. Damaged/legacy evidence falls back to the existing readonly audit.
+      // This is historical authority, never a claim about Apple's current state.
+      let checkpointHistory=skipCompleted && last?.event==="done", phase="", previousTime=-Infinity;
+      if (checkpointHistory) for (const entry of prior) {
+        const time=typeof entry.at==="string" ? Date.parse(entry.at) : NaN;
+        if (entry.before_sha256!==o.before_sha256 || !Number.isFinite(time) || time<previousTime ||
+            (entry.event==="intent" ? !["","reviewed-no-change"].includes(phase) :
+             entry.event==="uncertain" ? phase!=="intent" :
+             entry.event==="reviewed-no-change" ? !["intent","uncertain"].includes(phase) :
+             !["intent","uncertain"].includes(phase))) {checkpointHistory=false;break;}
+        phase=entry.event;previousTime=time;
+      }
+      // Completed/uncertain operations never replay intent. The explicit skip
+      // may reuse a qualified done only after all metadata/preimage checks below.
       if (last && last.event!=="reviewed-no-change") {
         if (o.kind === "notes-set") {
           const intent = prior.findLast(x => x.event === "intent"), intended = intent?.after_sha256;
@@ -486,6 +573,10 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
               (capturedTitle!==undefined && capturedTitle!==before.native_title)) fail("outcome_requires_review");
           const expected={...before,notes:o.notes!}, expectedHash=await hash(expected);
           if (intended!==expectedHash) fail("outcome_requires_review");
+          if (checkpointHistory && capturedTitle===before.native_title && last.after_sha256===expectedHash) {
+            await verifySnapshotOutput(file!,journalPath,opened);
+            skippedCompleted++;continue;
+          }
           const now = await native.read(o.target), h = await hash(now);
           // A private journal can still be damaged or copied incorrectly.
           // Its after-hash never substitutes for the original plan's note body.
@@ -494,22 +585,39 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
         } else {
           // Deleted notes cannot be edited. Bind placement/body verification to
           // the original empty-credential note snapshot, never infer empty data.
-          const capturedTitle = prior.findLast(x => x.event === "intent")?.before_native_title;
+          const intent=prior.findLast(x => x.event === "intent");
+          if (!intent) return fail("outcome_requires_review");
+          if (intent.before_sha256!==o.before_sha256 ||
+              (intent.deleted_preflight_absent!==undefined && typeof intent.deleted_preflight_absent!=="boolean")) fail("outcome_requires_review");
+          const capturedTitle = intent.before_native_title;
           if (capturedTitle !== undefined && (typeof capturedTitle !== "string" || capturedTitle.includes("\0"))) fail("outcome_requires_review");
           const deletedBefore: State = { key: o.target, native_title: capturedTitle === undefined ? o.target.title : capturedTitle, notes: o.preserve_text!, password: "",
             sites: [], sharing: "unshared", otp: "absent", passkey: "absent", extra_fields: [] };
           if (await hash(deletedBefore) !== o.before_sha256) fail("outcome_requires_review");
-          let active = false;
-          try { await native.read(o.target); active = true; } catch (e) { if (!(e instanceof APWError) || e.message !== "maintenance_item_not_found") throw e; }
-          if (active || await hash(await native.read(o.target, true, deletedBefore)) !== o.before_sha256 ||
-            await hash(await native.read(o.keeper!.target)) !== o.keeper!.before_sha256) fail("outcome_requires_review");
-          if (last.event !== "done") await append(o, "done");
+          if (intent.before_snapshot_path!==undefined) {
+            const path=journalPath+"."+o.id+".before.json";
+            if (intent.before_snapshot_path!==path || canonical(await notesPreimage(path,o.target,o.before_sha256))!==canonical(deletedBefore)) fail("outcome_requires_review");
+          } else if (intent.deleted_preflight_absent!==undefined) fail("outcome_requires_review");
+          const completedDeletionProof=last.content_preservation_verified===true &&
+            (last.deletion_verification==="full_deleted_body" ? last.deleted_body_verified===true :
+             last.deletion_verification==="content_preservation_deleted_location" ? last.deleted_body_verified===false && intent.deleted_preflight_absent===true :
+             last.deletion_verification==="legacy_pending_content_preservation_deleted_location" && last.deleted_body_verified===false && intent.deleted_preflight_absent===undefined);
+          if (checkpointHistory && completedDeletionProof && last.after_sha256===undefined &&
+              typeof capturedTitle==="string" && intent.before_snapshot_path===journalPath+"."+o.id+".before.json" &&
+              deletedBefore.key.username==="" && o.source_ids!.every(id=>deletedBefore.notes.includes(id))) {
+            await verifySnapshotOutput(file!,journalPath,opened);
+            skippedCompleted++;continue;
+          }
+          await exactActiveAbsence(native,o.target);
+          const proof=await verifyRedundantDeletion(native,o,deletedBefore,intent.deleted_preflight_absent);
+          contentPreservationVerifications++;if(proof.deleted_body_verified)deletedBodyVerifications++;
+          if (last.event !== "done") await append(o, "done",undefined,undefined,undefined,proof);
         }
         completed++; continue;
       }
       const before = await native.read(o.target);
       if (await hash(before) !== o.before_sha256) fail("preimage_changed");
-      let intended: State | undefined;
+      let intended: State | undefined, deletedPreflightAbsent: boolean | undefined;
       if (o.kind === "notes-set") {
         if (before.sharing !== "unshared" || !o.notes!.includes(before.notes)) fail("note_preservation_refused");
         intended = { ...before, notes: o.notes! };
@@ -519,10 +627,18 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
         const keeper = await native.read(o.keeper!.target);
         if (await hash(keeper) !== o.keeper!.before_sha256 || keeper.sharing !== "unshared" || !keeper.notes.includes(before.notes) ||
           o.source_ids!.some(x => !keeper.notes.includes(x))) fail("keeper_proof_refused");
+        try {
+          await native.call("deleted-location-read",{key:o.target,expected:before});
+          fail("deleted_identity_preexisting");
+        } catch (e) {
+          if (e instanceof APWError && e.message==="maintenance_item_not_found") deletedPreflightAbsent=true;
+          else if (e instanceof APWError && e.message==="maintenance_operation_unsupported") deletedPreflightAbsent=false;
+          else throw e;
+        }
       }
       const afterHash = intended ? await hash(intended) : undefined;
       let beforeSnapshotPath: string | undefined;
-      if (intended) {
+      if (intended || o.kind==="delete-redundant-note") {
         beforeSnapshotPath=journalPath+"."+o.id+".before.json";
         let snapshot: Deno.FsFile | undefined;
         try {snapshot=await Deno.open(beforeSnapshotPath,{createNew:true,write:true,mode:0o600});}
@@ -540,23 +656,25 @@ export async function runBatch(planPath: string, journalPath: string, apply: boo
           } finally {snapshot.close();}
         }
       }
-      await append(o, "intent", afterHash, before.native_title,beforeSnapshotPath); // both fsyncs precede any mutation
+      await append(o, "intent", afterHash, before.native_title,beforeSnapshotPath,undefined,deletedPreflightAbsent); // both fsyncs precede any mutation
       try {
         const result = await native.call(o.kind, { key: o.target, expected: before, ...(intended ? { notes: intended.notes } : {}) });
         mutations++;
+        let deletionProof:DeletionProof | undefined;
         if (intended) {
           if (await hash(await native.read(o.target)) !== afterHash) fail("readback_changed");
         } else {
-          if (result.recoverable !== true || await hash(await native.read(o.target, true, before)) !== o.before_sha256) fail("deletion_unverified");
-          let found = false;
-          try { await native.read(o.target); found = true; } catch (e) { if (!(e instanceof APWError) || e.message !== "maintenance_item_not_found") throw e; }
-          if (found || await hash(await native.read(o.keeper!.target)) !== o.keeper!.before_sha256) fail("deletion_unverified");
+          if (result.recoverable !== true) fail("deletion_unverified");
+          deletionProof=await verifyRedundantDeletion(native,o,before,deletedPreflightAbsent);
+          contentPreservationVerifications++;if(deletionProof.deleted_body_verified)deletedBodyVerifications++;
         }
-        await append(o, "done", afterHash); completed++;
+        await append(o, "done", afterHash,undefined,undefined,deletionProof); completed++;
         console.error(JSON.stringify({ event: "maintenance_checkpoint", id: o.id, completed, total: operations.length }));
       } catch (e) { await append(o, "uncertain", afterHash); throw e; }
     }
-    console.log(JSON.stringify({ completed, total: operations.length, mutations, ...(review ? {reviewed_no_change:reviewed}:{}), app_activated: false, imports: 0, exports: 0, permanent_deletions: 0 }));
+    console.log(JSON.stringify({ completed, total: operations.length, mutations, ...(review ? {reviewed_no_change:reviewed}:{}), ...(skipCompleted ? {skipped_completed:skippedCompleted}:{}),
+      content_preservation_verifications:contentPreservationVerifications,deleted_body_verifications:deletedBodyVerifications,
+      app_activated: false, imports: 0, exports: 0, permanent_deletions: 0 }));
   } finally {
     await native?.close(); file?.close();
     await Deno.remove(lock, { recursive: true });

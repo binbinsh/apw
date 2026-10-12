@@ -45,8 +45,8 @@ func unavailableContextStatus(editor:Bool,incomplete:Bool)->String {
  // screen. No authenticated-access permission follows from this status.
  incomplete ? "incomplete_window_observation":(editor ? "user_editor_open":"unavailable")
 }
-func queryStrategy(rangeSettable:Bool,textSettable:Bool,valueSettable:Bool=false)->String {
- rangeSettable && textSettable ? "selected-text":(valueSettable ? "witnessed-value":"unfiltered-index")
+func queryStrategy(rangeSettable:Bool,textSettable:Bool,valueSettable:Bool=false,background:Bool=false)->String {
+ background ? "unfiltered-index":(rangeSettable && textSettable ? "selected-text":(valueSettable ? "witnessed-value":"unfiltered-index"))
 }
 func acceptsSearchWitness(emptySeen:Bool,stableComplete:Bool,ownerUnchanged:Bool,count:Int)->Bool {
  emptySeen && stableComplete && ownerUnchanged && count>0 && count<=100
@@ -100,6 +100,64 @@ func searchClearInitialReady(_ frame:SearchPreparationFrame,queryEmpty:Bool,cach
  if cachedRawCount==frame.rawCount {return frame.rawCount>0 || frame.publishedCount==0}
  return frame.rawCount>0 && !modelNeedsProof
 }
+func searchClearPreparationRoute(_ frame:SearchPreparationFrame,queryEmpty:Bool,cachedRawCount:Int,modelNeedsProof:Bool,background:Bool)->String {
+ if searchClearInitialReady(frame,queryEmpty:queryEmpty,cachedRawCount:cachedRawCount,modelNeedsProof:modelNeedsProof) {return "ready"}
+ return background ? "hold":"recover"
+}
+struct SearchClearRecoveryObservation:Equatable {
+ let phase:String
+ let complete,ownerUnchanged,categoryMatches,uniqueSearch,windowBound,sentinelMatches:Bool
+ let rangeCode,textCode,valueCode:Int
+ let rangeSettable,textSettable,valueSettable:Bool
+ let semanticClear:String
+}
+struct SearchClearBindingObservation {
+ let clearCode,pidCode,parentCode,roleCode,enabledCode,actionsCode:Int
+ let elementType,samePID,parentIsSearch,enabled,pressAction:Bool
+ let role:String
+}
+func searchClearSemanticState(_ o:SearchClearBindingObservation)->String {
+ if o.clearCode==Int(AXError.noValue.rawValue) {return "absent"}
+ guard o.clearCode==0 else{return "unknown"}
+ return o.elementType && o.pidCode==0 && o.parentCode==0 && o.roleCode==0 && o.enabledCode==0 && o.actionsCode==0 &&
+  o.samePID && o.parentIsSearch && o.enabled && o.pressAction && o.role=="AXButton" ? "usable":"invalid"
+}
+// Only AXClearButton's explicit noValue observation means semantic absence.
+// Captions, an action acknowledgement and a visible empty query are not model
+// restoration evidence. The existing clear_model witness remains mandatory.
+func searchClearRecoveryAction(_ o:SearchClearRecoveryObservation)->String {
+ guard ["prepare","sentinel_observed"].contains(o.phase),o.complete,o.ownerUnchanged,
+  o.categoryMatches,o.uniqueSearch,o.windowBound,o.rangeCode==0,o.textCode==0 else{return "hold"}
+ if o.phase=="prepare",o.rangeSettable,o.textSettable {return "selected-text"}
+ guard !(o.rangeSettable && o.textSettable),o.phase=="prepare" || o.sentinelMatches else{return "hold"}
+ if o.semanticClear=="usable" {return "press-clear"}
+ guard o.semanticClear=="absent",o.valueCode==0,o.valueSettable else{return "hold"}
+ return o.phase=="prepare" ? "set-sentinel":"set-empty"
+}
+// CFHash collisions are not element identity. Retain each bucket and compare
+// actual CFEqual identity before deduplicating, including ancestry cycles.
+struct CollisionSafeVisited<Element> {
+ private var buckets:[UInt:[Element]]=[:]
+ private let hash:(Element)->UInt
+ private let equal:(Element,Element)->Bool
+ private(set) var count=0
+ init(hash:@escaping (Element)->UInt,equal:@escaping (Element,Element)->Bool) {self.hash=hash;self.equal=equal}
+ mutating func insert(_ element:Element)->Bool {
+  let key=hash(element)
+  if buckets[key]?.contains(where:{equal($0,element)}) == true {return false}
+  buckets[key,default:[]].append(element);count+=1
+  return true
+ }
+}
+func nativeVisited()->CollisionSafeVisited<AXUIElement> {
+ CollisionSafeVisited(hash:{CFHash($0)},equal:{CFEqual($0,$1)})
+}
+func editorObservationVerified(opened:Bool,ownerValid:Bool,fieldsComplete:Bool,snapshotComplete:Bool)->Bool {
+ opened && ownerValid && fieldsComplete && snapshotComplete
+}
+func retireVerifiedReadHistory(_ currentVerified:Bool,set:(Bool)->Void) {
+ if currentVerified {set(false)}
+}
 struct DeletedNoteFrame:Decodable {
  let selected_exact,title_matches,note_matches,recovery_unique,complete:Bool
  var verified:Bool {selected_exact && title_matches && note_matches && recovery_unique && complete}
@@ -111,6 +169,34 @@ struct DeletedNoteWitness {
   previousVerified=frame.verified
   return accepted
  }
+}
+// Location is a separate observation; it cannot stand in for a recovered
+// body or a current credential snapshot.
+struct DeletedLocationFrame:Decodable {
+ let selected_exact,title_matches,recovery_unique,query_empty,category_deleted,owner_unchanged,process_window_bound,detail_bound,complete:Bool
+ let row_binding:Int;let native_title:String
+ var verified:Bool {selected_exact && title_matches && recovery_unique && query_empty && category_deleted && owner_unchanged && process_window_bound && detail_bound && complete && row_binding>=0 && !native_title.isEmpty}
+}
+struct DeletedLocationWitness {
+ var previous:DeletedLocationFrame?
+ mutating func observe(_ frame:DeletedLocationFrame)->Bool {
+  guard frame.verified else{previous=nil;return false}
+  defer{previous=frame}
+  guard let old=previous else{return false}
+  return old.row_binding==frame.row_binding && old.native_title==frame.native_title
+ }
+}
+func deletedLocationPreimageValid(_ key:[String:String],_ expected:[String:Any])->Bool {
+ editorRecoveryPermits(expected:expected,observed:expected,complete:true,unique:true) &&
+ (expected["key"] as? [String:String])==key && key["username"]=="" && expected["native_title"] as? String==key["title"] &&
+ expected["password"] as? String=="" && (expected["sites"] as? [String])?.isEmpty==true &&
+ expected["otp"] as? String=="absent" && expected["passkey"] as? String=="absent" && expected["sharing"] as? String=="unshared" &&
+ (expected["extra_fields"] as? [[String:String]])?.isEmpty==true && !(expected["notes"] as? String ?? "").isEmpty
+}
+func deletedLocationResult(_ key:[String:String],nativeTitle:String)->[String:Any] {
+ ["ok":true,"verification":"deleted_note_location_only","body_verified":false,"app_activated":false,
+  "location":["category":"deleted","key":key,"native_title":nativeTitle,"selected_exact":true,"title_matches":true,
+   "recovery_unique":true,"frame_complete":true,"query_empty":true,"owner_unchanged":true,"stable_complete_frames":2]]
 }
 func recoveryVerificationFieldsSafe(_ roles:[String])->Bool {
  !roles.contains{["AXTextField","AXTextArea","AXComboBox"].contains($0)}
@@ -241,6 +327,39 @@ func privateData(_ path:String)->Data? {
  return try? h.readToEnd()
 }
 let args=Array(CommandLine.arguments.dropFirst())
+if args==["--read-editor-scope-replay-test"] {
+ guard let line=readLine(),let data=line.data(using:.utf8),let q=try? JSONSerialization.jsonObject(with:data) as? [String:Any],let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
+ var incomplete=q["prior_incomplete"] as? Bool ?? false
+ let prior=incomplete;var accepted=false
+ for frame in frames {
+  let verified=independentComplete(get:{incomplete},set:{incomplete=$0}) {()->Bool in
+   for code in frame["codes"] as? [Int32] ?? [] {if let error=AXError(rawValue:code),nativeReadErrorRefuses(error,required:false) {incomplete=true}}
+   return editorObservationVerified(opened:frame["opened"] as? Bool ?? false,ownerValid:frame["owner_unchanged"] as? Bool ?? false,fieldsComplete:frame["fields_complete"] as? Bool ?? false,snapshotComplete:frame["snapshot_complete"] as? Bool ?? false)
+  }
+  if verified==true {accepted=true;break}
+ }
+ let historyPreserved=incomplete==prior
+ retireVerifiedReadHistory(accepted,set:{incomplete=$0})
+ for code in q["post_codes"] as? [Int32] ?? [] {if let error=AXError(rawValue:code),nativeReadErrorRefuses(error,required:false) {incomplete=true}}
+ let output=try! JSONSerialization.data(withJSONObject:["accepted":accepted,"prior_preserved":historyPreserved,"next_phase_incomplete":incomplete,"apple_accessed":false],options:.sortedKeys)
+ print(String(data:output,encoding:.utf8)!);exit(0)
+}
+if args==["--deleted-location-replay-test"] {
+ guard let line=readLine(),let data=line.data(using:.utf8),let q=try? JSONSerialization.jsonObject(with:data) as? [String:Any],
+  let expected=q["expected"] as? [String:Any],let key=q["key"] as? [String:String],let frames=q["frames"] as? [[String:Any]],frames.count<=128,
+  let bytes=try? JSONSerialization.data(withJSONObject:frames),let decoded=try? JSONDecoder().decode([DeletedLocationFrame].self,from:bytes) else{exit(2)}
+ var result:[String:Any]=["ok":false,"apple_accessed":false]
+ if deletedLocationPreimageValid(key,expected) {
+  var witness=DeletedLocationWitness()
+  for frame in decoded {
+   var current=frame
+   if frame.native_title != key["title"] {current=DeletedLocationFrame(selected_exact:false,title_matches:false,recovery_unique:false,query_empty:false,category_deleted:false,owner_unchanged:false,process_window_bound:false,detail_bound:false,complete:false,row_binding:-1,native_title:"")}
+   if witness.observe(current) {result=deletedLocationResult(key,nativeTitle:frame.native_title);result["apple_accessed"]=false;break}
+  }
+ }
+ let output=try! JSONSerialization.data(withJSONObject:result,options:.sortedKeys)
+ print(String(data:output,encoding:.utf8)!);exit(0)
+}
 if args==["--search-replay-test"] {
  guard let line=readLine(),let data=line.data(using:.utf8),let q=try? JSONSerialization.jsonObject(with:data) as? [String:Any],
   let stage=q["stage"] as? String,["empty_witness","target_model","clear_model"].contains(stage),let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
@@ -267,17 +386,90 @@ if args==["--policy-test"] {
  guard let line=readLine(),let data=line.data(using:.utf8),let q=try? JSONSerialization.jsonObject(with:data) as? [String:Any] else{exit(2)}
  var result:Any
  switch q["operation"] as? String {
+ case "collision-safe-traversal":
+  guard let graph=q["nodes"] as? [[String:Any]],graph.count<=6000,let root=q["root"] as? Int,
+   let maxDepth=q["max_depth"] as? Int,(1...24).contains(maxDepth),let maxNodes=q["max_nodes"] as? Int,(1...6000).contains(maxNodes) else{exit(2)}
+  var children:[Int:[Int]]=[:],hashes:[Int:UInt]=[:]
+  for node in graph {
+   guard let id=node["id"] as? Int,let hash=node["hash"] as? UInt,let cs=node["children"] as? [Int],children[id]==nil else{exit(2)}
+   children[id]=cs;hashes[id]=hash
+  }
+  var seen=CollisionSafeVisited<Int>(hash:{hashes[$0] ?? 0},equal:{$0==$1}),visited:[Int]=[],complete=true
+  func walk(_ id:Int,_ depth:Int) {
+   guard depth<maxDepth,seen.count<maxNodes,let cs=children[id] else{complete=false;return}
+   guard seen.insert(id) else{return}
+   visited.append(id)
+   for child in cs {walk(child,depth+1)}
+  }
+  walk(root,0)
+  result=["visited":visited,"unique_count":seen.count,"complete":complete]
  case "lease":
   result=requestLeaseMode(foreground:pid_t(q["foreground"] as? Int ?? 0),passwords:pid_t(q["passwords"] as? Int ?? 0),keyboard:(q["keyboard"] as? Int).map(pid_t.init),ownedEditor:q["owned_editor"] as? Bool ?? false)
  case "unavailable-context-policy":result=unavailableContextStatus(editor:q["editor"] as? Bool ?? false,incomplete:q["incomplete"] as? Bool ?? false)
- case "query":result=queryStrategy(rangeSettable:q["range_settable"] as? Bool ?? false,textSettable:q["text_settable"] as? Bool ?? false,valueSettable:q["value_settable"] as? Bool ?? false)
+ case "query":result=queryStrategy(rangeSettable:q["range_settable"] as? Bool ?? false,textSettable:q["text_settable"] as? Bool ?? false,valueSettable:q["value_settable"] as? Bool ?? false,background:q["background"] as? Bool ?? false)
+ case "category-selection-route":
+  result=categorySelectionRoute(actualMatches:q["complete"] as? Bool==true ? q["actual_matches"] as? Bool:nil)
+ case "category-model-pair":
+  guard let first=q["first"] as? [String:Any],let second=q["second"] as? [String:Any],
+   let firstBytes=try? JSONSerialization.data(withJSONObject:first),let secondBytes=try? JSONSerialization.data(withJSONObject:second),
+   let before=try? JSONDecoder().decode(CurrentCategoryIndexFrame.self,from:firstBytes),let after=try? JSONDecoder().decode(CurrentCategoryIndexFrame.self,from:secondBytes) else{exit(2)}
+  result=categoryModelPairPermits(before,after,referencesSame:q["references_same"] as? Bool ?? false)
+ case "category-clear-wait-first":
+  result=categoryClearWaitFirst(background:q["background"] as? Bool ?? false,pendingNavigation:q["pending_navigation"] as? Bool ?? false,initialQueryEmpty:q["query_empty"] as? Bool ?? false)
+ case "deleted-expected-arrival":
+  guard let title=q["title"] as? String,!title.isEmpty,let frames=q["frames"] as? [[String:Any]],frames.count<=128 else{exit(2)}
+  var witness=DeletedArrivalWitness(title:title),outcome="unverified"
+  for raw in frames {
+   guard raw["deadline_valid"] as? Bool == true else{break}
+   guard let bytes=try? JSONSerialization.data(withJSONObject:raw),let frame=try? JSONDecoder().decode(CurrentCategoryIndexFrame.self,from:bytes) else{exit(2)}
+   let observed=witness.observe(frame)
+   if observed != "waiting" {outcome=observed;break}
+  }
+  result=outcome
+ case "deleted-cache-miss":
+  guard let title=q["title"] as? String,!title.isEmpty,let cached=q["cached_labels"] as? [[String]],let frames=q["frames"] as? [[String:Any]],frames.count<=128,
+   let bytes=try? JSONSerialization.data(withJSONObject:frames),let decoded=try? JSONDecoder().decode([CurrentCategoryIndexFrame].self,from:bytes) else{exit(2)}
+  if !deletedCacheMissNeedsCurrent(cached,title:title) {result="route-cached"}
+  else {
+   var witness=CurrentCategoryIndexWitness(),outcome="hold"
+   for frame in decoded {
+    if witness.observe(frame) {
+     let matches=matchingNativeLabels(frame.labels,title:title,username:"").count
+     outcome=matches==0 ? "absent":(matches==1 ? "present":"ambiguous");break
+    }
+   }
+   result=outcome
+  }
+ case "full-index-absence":
+  guard let key=q["key"] as? [String:String],let title=key["title"],!title.isEmpty,let user=key["username"],
+   let frames=q["frames"] as? [[String:Any]],frames.count<=128,let bytes=try? JSONSerialization.data(withJSONObject:frames),
+   let decoded=try? JSONDecoder().decode([CurrentCategoryIndexFrame].self,from:bytes) else{exit(2)}
+  var witness=CurrentCategoryIndexWitness(),outcome="hold"
+  for frame in decoded {
+   if witness.observe(frame) {outcome=matchingNativeLabels(frame.labels,title:title,username:user).isEmpty ? "absent":"present";break}
+  }
+  result=outcome
  case "witness":result=acceptsSearchWitness(emptySeen:q["empty_seen"] as? Bool ?? false,stableComplete:q["stable_complete"] as? Bool ?? false,ownerUnchanged:q["owner_unchanged"] as? Bool ?? false,count:q["count"] as? Int ?? -1)
  case "recoverable-dialog":result=recoverableDialog(words:q["words"] as? [String] ?? [],ordinaryButton:q["ordinary_button"] as? Bool ?? false,permanentButton:q["permanent_button"] as? Bool ?? false)
  case "selection-scope":result=addressedSelectionScope(role:q["role"] as? String ?? "",identifier:q["identifier"] as? String ?? "",subrole:q["subrole"] as? String ?? "")
  case "query-clear-policy":result=requiresQueryClear(fullIndex:q["full_index"] as? Bool ?? false,queryEmpty:q["query_empty"] as? Bool ?? false)
- case "search-clear-initial":
+ case "search-clear-recovery":
+  result=searchClearRecoveryAction(SearchClearRecoveryObservation(phase:q["phase"] as? String ?? "",complete:q["complete"] as? Bool ?? false,
+   ownerUnchanged:q["owner_unchanged"] as? Bool ?? false,categoryMatches:q["category_matches"] as? Bool ?? false,
+   uniqueSearch:q["unique_search"] as? Bool ?? false,windowBound:q["window_bound"] as? Bool ?? false,sentinelMatches:q["sentinel_matches"] as? Bool ?? false,
+   rangeCode:q["range_code"] as? Int ?? -1,textCode:q["text_code"] as? Int ?? -1,valueCode:q["value_code"] as? Int ?? -1,
+   rangeSettable:q["range_settable"] as? Bool ?? false,textSettable:q["text_settable"] as? Bool ?? false,valueSettable:q["value_settable"] as? Bool ?? false,
+   semanticClear:q["semantic_clear"] as? String ?? "unknown"))
+ case "search-clear-binding":
+  result=searchClearSemanticState(SearchClearBindingObservation(clearCode:q["clear_code"] as? Int ?? -1,pidCode:q["pid_code"] as? Int ?? -1,
+   parentCode:q["parent_code"] as? Int ?? -1,roleCode:q["role_code"] as? Int ?? -1,enabledCode:q["enabled_code"] as? Int ?? -1,actionsCode:q["actions_code"] as? Int ?? -1,
+   elementType:q["element_type"] as? Bool ?? false,samePID:q["same_pid"] as? Bool ?? false,parentIsSearch:q["parent_is_search"] as? Bool ?? false,
+   enabled:q["enabled"] as? Bool ?? false,pressAction:q["press_action"] as? Bool ?? false,role:q["role"] as? String ?? ""))
+ case "search-clear-initial","search-clear-route":
   let frame=SearchPreparationFrame(complete:q["complete"] as? Bool ?? false,queryMatches:q["query_empty"] as? Bool ?? false,categoryMatches:q["category_matches"] as? Bool ?? false,ownerUnchanged:q["owner_unchanged"] as? Bool ?? false,rawCount:q["raw_count"] as? Int ?? -1,publishedCount:q["published_count"] as? Int ?? -1,labels:[],targetPresent:false)
-  result=searchClearInitialReady(frame,queryEmpty:q["query_empty"] as? Bool ?? false,cachedRawCount:q["cached_raw_count"] as? Int ?? -1,modelNeedsProof:q["model_needs_proof"] as? Bool ?? false)
+  if q["operation"] as? String=="search-clear-route" {
+   result=searchClearPreparationRoute(frame,queryEmpty:q["query_empty"] as? Bool ?? false,cachedRawCount:q["cached_raw_count"] as? Int ?? -1,modelNeedsProof:q["model_needs_proof"] as? Bool ?? false,background:q["background"] as? Bool ?? false)
+  } else {result=searchClearInitialReady(frame,queryEmpty:q["query_empty"] as? Bool ?? false,cachedRawCount:q["cached_raw_count"] as? Int ?? -1,modelNeedsProof:q["model_needs_proof"] as? Bool ?? false)}
  case "deleted-frame-pair":
   guard let frames=q["frames"] as? [[String:Any]],frames.count<=128,let bytes=try? JSONSerialization.data(withJSONObject:frames),let decoded=try? JSONDecoder().decode([DeletedNoteFrame].self,from:bytes) else{exit(2)}
   var witness=DeletedNoteWitness(),accepted=false
@@ -345,10 +537,10 @@ func attr(_ n:AXUIElement,_ k:String)->CFTypeRef? {
 }
 func text(_ n:AXUIElement,_ k:String)->String {attr(n,k) as? String ?? ""}
 func nodes(_ root:AXUIElement,prune:Bool=true)->[AXUIElement] {
- var out:[AXUIElement]=[];var seen=Set<UInt>()
+ var out:[AXUIElement]=[];var seen=nativeVisited()
  func walk(_ n:AXUIElement,_ depth:Int){
   guard depth<24,out.count<6000,Date()<deadline else{nativeObservationIncomplete=true;return}
-  guard seen.insert(CFHash(n)).inserted else{return}
+  guard seen.insert(n) else{return}
   let r=text(n,kAXRoleAttribute);guard !["AXMenuBar","AXMenu","AXMenuItem"].contains(r) else{return};out.append(n)
   if prune && ["AXOutline","AXTable"].contains(r){return}
   for c in attr(n,kAXChildrenAttribute) as? [AXUIElement] ?? [] {walk(c,depth+1)}
@@ -357,11 +549,11 @@ func nodes(_ root:AXUIElement,prune:Bool=true)->[AXUIElement] {
 }
 func values(_ ns:[AXUIElement])->[String] {ns.flatMap{n in [kAXTitleAttribute,kAXDescriptionAttribute,kAXValueAttribute].compactMap{attr(n,$0) as? String}}}
 func rowValues(_ row:AXUIElement)->[String] {
- var out:[String]=[],seen=Set<UInt>()
+ var out:[String]=[],seen=nativeVisited()
  let names=[kAXRoleAttribute,kAXTitleAttribute,kAXDescriptionAttribute,kAXValueAttribute,kAXChildrenAttribute] as CFArray
  func walk(_ n:AXUIElement,_ depth:Int) {
   guard depth<12,seen.count<100,Date()<deadline else{nativeObservationIncomplete=true;return}
-  guard seen.insert(CFHash(n)).inserted else{return}
+  guard seen.insert(n) else{return}
   var values:CFArray?
   let code=AXUIElementCopyMultipleAttributeValues(n,names,[],&values);observeNativeError(code,required:true)
   guard code == .success,let v=values as? [Any],v.count==5,v[0] is String else{nativeObservationIncomplete=true;return}
@@ -656,7 +848,7 @@ func websites(_ editor:[AXUIElement])->(Bool,[String]) {
  }
  return (true,Array(Set(found)))
 }
-struct NativeRead {let row:AXUIElement;let fieldValues:[String:String];let editor:[AXUIElement];let shared:String;let sitesKnown:Bool;let sites:[String];let otpAbsent,passkeyAbsent:Bool;let shape:[String:Any]}
+struct NativeRead {let row:AXUIElement;let fieldValues:[String:String];let editor:[AXUIElement];let shared:String;let sitesKnown:Bool;let sites:[String];let otpAbsent,passkeyAbsent:Bool;let shape:[String:Any];var verifiedCanonicalState:[String:Any]?=nil}
 func targetQuery(_ t:Target)->String {
  if let url=t.urls.first,!host(url).isEmpty {return host(url)}
  if t.username.isEmpty,t.title.contains(" · 资料 ["),t.title.hasSuffix("]"),let bracket=t.title.lastIndex(of:"[") {
@@ -747,11 +939,12 @@ func read(_ root:AXUIElement,_ t:Target,leaveOpen:Bool=false,onEditorOpened:(()-
  }
  phase("detail_binding")
  report["selection_context"]=["selected_identity_confirmed":selected,"edit_button_unique":edit != nil]
- let group=sharing(view)
- let detailSnapshot=values(view)
+ guard let detailObservation=completeDiscovery({(sharing(view),values(view))}) else{report["failure_stage"]="detail_observation_incomplete";return nil}
+ let group=detailObservation.0,detailSnapshot=detailObservation.1
  let boundView=detailSnapshot.contains(t.title) && (t.notes.isEmpty || detailSnapshot.contains(t.notes)) && (t.username.isEmpty || detailSnapshot.contains(t.username))
  guard selected,let edit,boundedClick(edit,root) else{report["failure_stage"]="open_readonly_editor";report["selection_diagnostics"]=selectionDiagnostics(root);return nil}
  let editorUntil=min(deadline,Date(timeIntervalSinceNow:3))
+ report["read_editor_previous_incomplete"]=nativeObservationIncomplete;report["read_editor_opened"]=false;report["read_editor_observation_complete"]=false;report["read_editor_frames_observed"]=0
  var opened=false
  while front(),Date()<editorUntil {
   let observed=completeDiscovery {()->Bool in
@@ -762,63 +955,88 @@ func read(_ root:AXUIElement,_ t:Target,leaveOpen:Bool=false,onEditorOpened:(()-
   if observed==true {opened=true;onEditorOpened?();break}
   pause(0.03)
  }
- guard opened,!nativeObservationIncomplete else{report["failure_stage"]="editor_open_unverified";return nil}
- let wantedHosts=Set(t.urls.map(host));let siteUntil=Date(timeIntervalSinceNow:1.5)
- var ns=nodes(root);var fs=fields(ns);var sites=websites(ns)
- while front(),!wantedHosts.isEmpty,!wantedHosts.isSubset(of:Set(sites.1.map(host))),Date()<siteUntil {
-  pause(0.05);ns=nodes(root);fs=fields(ns);sites=websites(ns)
- }
- let form=formNodes(ns)
- let forbidden=form.filter{["AXButton","AXStaticText","AXLink"].contains(text($0,kAXRoleAttribute)) && !["NotesField","TitleField","UserNameField","PasswordField"].contains(text($0,kAXIdentifierAttribute))}.flatMap{values([$0])}.contains{ s in
-  let lower=s.lowercased();return (s.contains("通行密钥") || lower.contains("passkey")) && !s.contains("添加通行密钥") && !lower.contains("add passkey") && !s.contains("进一步了解") && !lower.contains("learn more")
- }
- let setupNames=["设置密钥","Set Up Key","设置密钥…","Set Up Key…","设置密钥...","Set Up Key...","设置验证码","Set Up Verification Code","设置验证码…","Set Up Verification Code…","设置验证码...","Set Up Verification Code...","添加验证码","Add Verification Code","添加验证码…","Add Verification Code…"]
- let setupButtons=form.filter{text($0,kAXRoleAttribute)=="AXButton" && values([$0]).contains(where:{setupNames.contains($0)})}
- let codeLabels=form.filter{text($0,kAXIdentifierAttribute)=="VerificationCodeField"}
- let codeLabelKnown=codeLabels.count==1 && text(codeLabels[0],kAXRoleAttribute)=="AXStaticText"
- let noOTP = codeLabelKnown && setupButtons.count==1
- let shape:[String:Any]=["website_add_field_empty":fs["WebsiteField"]=="","verification_field_empty":fs["VerificationCodeField"]=="","form_root_found":!form.isEmpty,"verification_identifiers":Set(form.map{text($0,kAXIdentifierAttribute)}.filter{$0.lowercased().contains("verification")}).sorted(),"support_link_candidates":sites.1.filter{host($0)=="support.apple.com"}.count,"verification_label_recognized":codeLabelKnown,"setup_code_button_count":setupButtons.count]
- var detailShape=shape
- let safeSiteNodes=ns.filter{!["TitleField","NotesField","UserNameField","PasswordField"].contains(text($0,kAXIdentifierAttribute))}
- let exactSiteNodes=safeSiteNodes.filter{n in values([n]).contains{v in t.urls.contains(v) || wantedHosts.contains(v)}}
- detailShape["website_structure"]=["exact_website_nodes":exactSiteNodes.count,"exact_website_roles":exactSiteNodes.map{text($0,kAXRoleAttribute)},
-  "form_contains_exact_website":form.contains{n in exactSiteNodes.contains{CFEqual(n,$0)}},
-  "exact_site_section_identifier":exactSiteNodes.map{text($0,kAXIdentifierAttribute)=="WebsiteField"},
-  "exact_site_under_label_parent":ns.filter{text($0,kAXIdentifierAttribute)=="WebsiteField"}.map{n->Bool in
-   guard let p=attr(n,kAXParentAttribute),CFGetTypeID(p)==AXUIElementGetTypeID() else{return false}
-   let pn=nodes(unsafeBitCast(p,to:AXUIElement.self));return pn.contains{child in exactSiteNodes.contains{CFEqual(child,$0)}}
-  },
-  "other_editable_count":safeSiteNodes.filter{additionalEditableData(text($0,kAXRoleAttribute),text($0,kAXIdentifierAttribute),text($0,kAXValueAttribute))}.count,
-  "site_section_parent_roles":safeSiteNodes.filter{text($0,kAXIdentifierAttribute)=="WebsiteField"}.map{n-> [String] in
-   var current=n;var roles:[String]=[]
-   for _ in 0..<8 {guard let p=attr(current,kAXParentAttribute),CFGetTypeID(p)==AXUIElementGetTypeID() else{break};current=unsafeBitCast(p,to:AXUIElement.self);roles.append(text(current,kAXRoleAttribute))}
-   return roles
-  }]
- for id in ["WebsiteField","VerificationCodeField"] {
-  if let node=ns.first(where:{text($0,kAXIdentifierAttribute)==id}) {
-   let value=text(node,kAXValueAttribute),placeholder=text(node,"AXPlaceholderValue")
-   detailShape[id] = ["role":text(node,kAXRoleAttribute),"value_matches_placeholder":!placeholder.isEmpty && value==placeholder,
-   "known_static_label": ["网站","网址","网站地址","URL","Website","Websites","website","websites","网站 URL","网站URL","无网站","无网址","未提供","未设置","无","None","No Website","No Websites"].first{sectionLabel(value)==$0} ?? "unrecognized",
-   "value_length":value.utf16.count,
-   "is_add_website_hint":["添加网站","Add Website","添加网站…","Add Website…"].contains(value),
-   "is_setup_code_hint":["设置密钥","Set Up Key","设置密钥…","Set Up Key…","设置验证码","Set Up Verification Code","输入密钥","Enter Key"].contains(value)]
+ report["read_editor_opened"]=opened
+ guard opened else{report["failure_stage"]="editor_open_unverified";return nil}
+ let wantedHosts=Set(t.urls.map(host)),frameUntil=min(deadline,Date(timeIntervalSinceNow:2))
+ while front(),Date()<frameUntil {
+  report["read_editor_frames_observed"]=min(3000,(report["read_editor_frames_observed"] as? Int ?? 0)+1)
+  if let observed=completeDiscovery({()->NativeRead? in
+   let ns=nodes(root),fs=fields(ns),sites=websites(ns)
+   guard wantedHosts.isSubset(of:Set(sites.1.map(host))) else{return nil}
+   let form=formNodes(ns)
+   let forbidden=form.filter{["AXButton","AXStaticText","AXLink"].contains(text($0,kAXRoleAttribute)) && !["NotesField","TitleField","UserNameField","PasswordField"].contains(text($0,kAXIdentifierAttribute))}.flatMap{values([$0])}.contains{ s in
+    let lower=s.lowercased();return (s.contains("通行密钥") || lower.contains("passkey")) && !s.contains("添加通行密钥") && !lower.contains("add passkey") && !s.contains("进一步了解") && !lower.contains("learn more")
+   }
+   let setupNames=["设置密钥","Set Up Key","设置密钥…","Set Up Key…","设置密钥...","Set Up Key...","设置验证码","Set Up Verification Code","设置验证码…","Set Up Verification Code…","设置验证码...","Set Up Verification Code...","添加验证码","Add Verification Code","添加验证码…","Add Verification Code…"]
+   let setupButtons=form.filter{text($0,kAXRoleAttribute)=="AXButton" && values([$0]).contains(where:{setupNames.contains($0)})}
+   let codeLabels=form.filter{text($0,kAXIdentifierAttribute)=="VerificationCodeField"}
+   let codeLabelKnown=codeLabels.count==1 && text(codeLabels[0],kAXRoleAttribute)=="AXStaticText"
+   let noOTP = codeLabelKnown && setupButtons.count==1
+   let shape:[String:Any]=["website_add_field_empty":fs["WebsiteField"]=="","verification_field_empty":fs["VerificationCodeField"]=="","form_root_found":!form.isEmpty,"verification_identifiers":Set(form.map{text($0,kAXIdentifierAttribute)}.filter{$0.lowercased().contains("verification")}).sorted(),"support_link_candidates":sites.1.filter{host($0)=="support.apple.com"}.count,"verification_label_recognized":codeLabelKnown,"setup_code_button_count":setupButtons.count]
+   var detailShape=shape
+   let safeSiteNodes=ns.filter{!["TitleField","NotesField","UserNameField","PasswordField"].contains(text($0,kAXIdentifierAttribute))}
+   let exactSiteNodes=safeSiteNodes.filter{n in values([n]).contains{v in t.urls.contains(v) || wantedHosts.contains(v)}}
+   detailShape["website_structure"]=["exact_website_nodes":exactSiteNodes.count,"exact_website_roles":exactSiteNodes.map{text($0,kAXRoleAttribute)},
+    "form_contains_exact_website":form.contains{n in exactSiteNodes.contains{CFEqual(n,$0)}},
+    "exact_site_section_identifier":exactSiteNodes.map{text($0,kAXIdentifierAttribute)=="WebsiteField"},
+    "exact_site_under_label_parent":ns.filter{text($0,kAXIdentifierAttribute)=="WebsiteField"}.map{n->Bool in
+     guard let p=attr(n,kAXParentAttribute),CFGetTypeID(p)==AXUIElementGetTypeID() else{return false}
+     let pn=nodes(unsafeBitCast(p,to:AXUIElement.self));return pn.contains{child in exactSiteNodes.contains{CFEqual(child,$0)}}
+    },
+    "other_editable_count":safeSiteNodes.filter{additionalEditableData(text($0,kAXRoleAttribute),text($0,kAXIdentifierAttribute),text($0,kAXValueAttribute))}.count,
+    "site_section_parent_roles":safeSiteNodes.filter{text($0,kAXIdentifierAttribute)=="WebsiteField"}.map{n-> [String] in
+     var current=n;var roles:[String]=[]
+     for _ in 0..<8 {guard let p=attr(current,kAXParentAttribute),CFGetTypeID(p)==AXUIElementGetTypeID() else{break};current=unsafeBitCast(p,to:AXUIElement.self);roles.append(text(current,kAXRoleAttribute))}
+     return roles
+    }]
+   for id in ["WebsiteField","VerificationCodeField"] {
+    if let node=ns.first(where:{text($0,kAXIdentifierAttribute)==id}) {
+     let value=text(node,kAXValueAttribute),placeholder=text(node,"AXPlaceholderValue")
+     detailShape[id] = ["role":text(node,kAXRoleAttribute),"value_matches_placeholder":!placeholder.isEmpty && value==placeholder,
+     "known_static_label": ["网站","网址","网站地址","URL","Website","Websites","website","websites","网站 URL","网站URL","无网站","无网址","未提供","未设置","无","None","No Website","No Websites"].first{sectionLabel(value)==$0} ?? "unrecognized",
+     "value_length":value.utf16.count,
+     "is_add_website_hint":["添加网站","Add Website","添加网站…","Add Website…"].contains(value),
+     "is_setup_code_hint":["设置密钥","Set Up Key","设置密钥…","Set Up Key…","设置验证码","Set Up Verification Code","输入密钥","Enter Key"].contains(value)]
+    }
+   }
+   phase("editor_fields")
+   let currentSharing=sharing(ns)
+   let effectiveSharing=currentSharing=="unshared" ? currentSharing:(boundView ? group:"unknown")
+   var n=NativeRead(row:row,fieldValues:fs,editor:ns,shared:effectiveSharing,sitesKnown:sites.0,sites:sites.1,otpAbsent:noOTP,passkeyAbsent:!form.isEmpty && sites.0 && sites.1.isEmpty && t.username.isEmpty && !forbidden,shape:detailShape)
+   let fieldsComplete=["TitleField","UserNameField","PasswordField","NotesField"].allSatisfy{fs[$0] != nil} && sites.0 && !form.isEmpty && fs["TitleField"]==t.native_title && fs["UserNameField"]==t.username
+   guard fieldsComplete,let value=try? snapshot(["title":t.title,"username":t.username],n),
+    editorObservationVerified(opened:opened,ownerValid:front(),fieldsComplete:fieldsComplete,snapshotComplete:true) else{return nil}
+   n.verifiedCanonicalState=value
+   return n
+  }),let n=observed {
+   report["read_editor_observation_complete"]=true
+   // The whole current editor and canonical state above are complete and
+   // exactly bound to this target. Retire only earlier transition history;
+   // errors raised by Cancel or any subsequent phase remain rejecting.
+   retireVerifiedReadHistory(n.verifiedCanonicalState != nil,set:{nativeObservationIncomplete=$0})
+   if !leaveOpen, !cancel(root,n) {report["failure_stage"]="cancel_readonly_editor";return nil}
+   return n
   }
+  pause(0.04)
  }
- phase("editor_fields")
- let currentSharing=sharing(ns)
- let effectiveSharing=currentSharing=="unshared" ? currentSharing:(boundView ? group:"unknown")
- let n=NativeRead(row:row,fieldValues:fs,editor:ns,shared:effectiveSharing,sitesKnown:sites.0,sites:sites.1,otpAbsent:noOTP,passkeyAbsent:!form.isEmpty && sites.0 && sites.1.isEmpty && t.username.isEmpty && !forbidden,shape:detailShape)
- if !leaveOpen, !cancel(root,n) {report["failure_stage"]="cancel_readonly_editor";return nil}
- return n
+ report["failure_stage"]="editor_snapshot_incomplete"
+ return nil
 }
 func cancel(_ root:AXUIElement,_ n:NativeRead,actionGuard:(()->Bool)?=nil)->Bool {
- let ns=nodes(root)
- report["cancel_context"]=["foreground":front(),"fields_unchanged":fields(ns)==n.fieldValues,"selected_row":attr(n.row,kAXSelectedAttribute) as? Bool==true,"cancel_button_unique":button(ns,["取消","Cancel"]) != nil]
- guard front(),fields(ns)==n.fieldValues,let b=button(ns,["取消","Cancel"]),actionGuard?() ?? true,boundedClick(b,root) else{return false}
+ // A prior selection/transition error is diagnostic history, not evidence
+ // about this freshly observed owned editor. Any current error rejects the
+ // pre-action frame before Cancel can be invoked.
+ guard let observed=completeDiscovery({()->AXUIElement? in
+  let ns=nodes(root),unchanged=fields(ns)==n.fieldValues,ownerValid=front(),cancelButton=button(ns,["取消","Cancel"])
+  report["cancel_context"]=["foreground":ownerValid,"fields_unchanged":unchanged,"cancel_button_unique":cancelButton != nil]
+  guard ownerValid,unchanged,actionGuard?() ?? true else{return nil}
+  return cancelButton
+ }),let b=observed,boundedClick(b,root) else{return false}
  guard waitForList(root) else{return false}
  if let (ownedRoot,_)=ownEditor,CFEqual(root,ownedRoot) {ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false;ownSyntheticInputAttempted=false}
  return true
 }
+
 func waitForList(_ root:AXUIElement,seconds:TimeInterval=3)->Bool {
  let until=min(deadline,Date(timeIntervalSinceNow:seconds))
  while front(),Date()<until {
@@ -1037,6 +1255,7 @@ func clearAllListBridge(_ root:AXUIElement)->Bool {
 var activeLabels:[[String]]?
 var deletedLabels:[[String]]?
 var currentCategory=""
+var categoryNavigationNeedsProof=false
 var indexedCategory=""
 var indexedQuery=""
 var failedIndexCategories=Set<String>()
@@ -1272,6 +1491,91 @@ func searchPreparationFrame(_ root:AXUIElement,phase:String,query:String,categor
  report["search_model_frame_counts"]=counts
  return SearchPreparationFrame(complete:complete,queryMatches:queryMatches,categoryMatches:categoryMatches,ownerUnchanged:ownerUnchanged,rawCount:rawCount,publishedCount:publishedCount,labels:labels,targetPresent:withLabels && labels.contains{$0.contains(query)})
 }
+struct SearchClearRecoveryFrame {
+ let field,window:AXUIElement
+ let clear:AXUIElement?
+ let observation:SearchClearRecoveryObservation
+}
+func searchClearRecoveryFrame(_ root:AXUIElement,phase:String,wanted:String,owner:pid_t?,keyboard:pid_t?)->SearchClearRecoveryFrame? {
+ guard let observed=completeDiscovery({()->SearchClearRecoveryFrame? in
+  guard let (field,_)=context(root),let value=attr(field,kAXValueAttribute) as? String,value==wanted else{return nil}
+  let windows=nodes(root).filter{text($0,kAXSubroleAttribute)=="AXStandardWindow"}
+  guard windows.count==1,notesProbeAncestorBound(field,windows[0]) else{return nil}
+  let category=categoryEvidence(root,currentCategory).0
+  let sameOwner=front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard
+  guard category,sameOwner else{return nil}
+  var range=DarwinBoolean(false),selected=DarwinBoolean(false),valueWritable=DarwinBoolean(false)
+  let rangeCode=AXUIElementIsAttributeSettable(field,kAXSelectedTextRangeAttribute as CFString,&range)
+  let textCode=AXUIElementIsAttributeSettable(field,kAXSelectedTextAttribute as CFString,&selected)
+  let valueCode=AXUIElementIsAttributeSettable(field,kAXValueAttribute as CFString,&valueWritable)
+  observeNativeError(rangeCode,required:true);observeNativeError(textCode,required:true);observeNativeError(valueCode)
+  var clearValue:CFTypeRef?
+  let clearCode=AXUIElementCopyAttributeValue(field,"AXClearButton" as CFString,&clearValue)
+  observeNativeError(clearCode)
+  var clear:AXUIElement?,state="unknown"
+  if clearCode == .noValue {state="absent"}
+  else if clearCode == .success,let clearValue,CFGetTypeID(clearValue)==AXUIElementGetTypeID() {
+   let candidate=unsafeBitCast(clearValue,to:AXUIElement.self)
+   var pid:pid_t=0,parent:CFTypeRef?,role:CFTypeRef?,enabled:CFTypeRef?,actions:CFArray?
+   let pidCode=AXUIElementGetPid(candidate,&pid)
+   let parentCode=AXUIElementCopyAttributeValue(candidate,kAXParentAttribute as CFString,&parent)
+   let roleCode=AXUIElementCopyAttributeValue(candidate,kAXRoleAttribute as CFString,&role)
+   let enabledCode=AXUIElementCopyAttributeValue(candidate,kAXEnabledAttribute as CFString,&enabled)
+   let actionsCode=AXUIElementCopyActionNames(candidate,&actions)
+   for code in [pidCode,parentCode,roleCode,enabledCode,actionsCode] {observeNativeError(code,required:true)}
+   let parentBound=parent.map{CFGetTypeID($0)==AXUIElementGetTypeID() && CFEqual($0,field)} ?? false
+   let enabledExact=enabled.map{CFGetTypeID($0)==CFBooleanGetTypeID() && ($0 as? Bool)==true} ?? false
+   state=searchClearSemanticState(SearchClearBindingObservation(clearCode:Int(clearCode.rawValue),pidCode:Int(pidCode.rawValue),parentCode:Int(parentCode.rawValue),
+    roleCode:Int(roleCode.rawValue),enabledCode:Int(enabledCode.rawValue),actionsCode:Int(actionsCode.rawValue),elementType:true,samePID:pid==appPID,
+    parentIsSearch:parentBound,enabled:enabledExact,pressAction:(actions as? [String])?.contains(kAXPressAction)==true,role:role as? String ?? ""))
+   if state=="usable" {clear=candidate}
+  } else if clearCode == .success {state="invalid"}
+  return SearchClearRecoveryFrame(field:field,window:windows[0],clear:clear,observation:SearchClearRecoveryObservation(phase:phase,complete:true,
+   ownerUnchanged:sameOwner,categoryMatches:category,uniqueSearch:true,windowBound:true,sentinelMatches:phase=="sentinel_observed" && value==wanted,
+   rangeCode:Int(rangeCode.rawValue),textCode:Int(textCode.rawValue),valueCode:Int(valueCode.rawValue),rangeSettable:range.boolValue,
+   textSettable:selected.boolValue,valueSettable:valueWritable.boolValue,semanticClear:state))
+ }),let frame=observed else{return nil}
+ return frame
+}
+func stableSearchClearRecoveryFrame(_ root:AXUIElement,phase:String,wanted:String,owner:pid_t?,keyboard:pid_t?)->SearchClearRecoveryFrame? {
+ let until=min(deadline,Date(timeIntervalSinceNow:2));var previous:SearchClearRecoveryFrame?
+ while front(),Date()<until {
+  if let frame=searchClearRecoveryFrame(root,phase:phase,wanted:wanted,owner:owner,keyboard:keyboard) {
+   if let previous,previous.observation==frame.observation,CFEqual(previous.field,frame.field),CFEqual(previous.window,frame.window),
+    ((previous.clear==nil && frame.clear==nil) || (previous.clear != nil && frame.clear != nil && CFEqual(previous.clear!,frame.clear!))) {return frame}
+   previous=frame
+  } else {previous=nil}
+  pause(0.04)
+ }
+ return nil
+}
+func recoverSearchClear(_ root:AXUIElement,old:String,owner:pid_t?,keyboard:pid_t?)->String? {
+ guard let prepared=stableSearchClearRecoveryFrame(root,phase:"prepare",wanted:old,owner:owner,keyboard:keyboard) else{report["search_clear_failure"]="clear_binding_unverified";return nil}
+ let first=searchClearRecoveryAction(prepared.observation)
+ guard ["press-clear","set-sentinel"].contains(first) else{report["search_clear_failure"]="clear_capability_incomplete";return nil}
+ searchModelNeedsProof=true;indexedLabels=nil;indexedCategory="";indexedQuery=""
+ if first=="press-clear" {
+  report["search_clear_method"]="addressed_semantic_clear"
+  guard let clear=prepared.clear,press(clear) else{report["search_clear_failure"]="clear_action_refused";return nil}
+  return "addressed_semantic_clear"
+ }
+ // At most one harmless synthetic query cycle. Only the semantic clear
+ // attribute may select a button; never press the Search/magnifier child.
+ let sentinel="apw-clear-model-"+UUID().uuidString.lowercased()
+ report["search_clear_method"]="addressed_value_cycle"
+ guard set(prepared.field,kAXValueAttribute,sentinel as CFString) else{report["search_clear_failure"]="clear_value_submission_failed";return nil}
+ guard let seeded=stableSearchClearRecoveryFrame(root,phase:"sentinel_observed",wanted:sentinel,owner:owner,keyboard:keyboard) else{report["search_clear_failure"]="clear_binding_unverified";return nil}
+ switch searchClearRecoveryAction(seeded.observation) {
+ case "press-clear":
+  report["search_clear_method"]="addressed_value_then_semantic_clear"
+  guard let clear=seeded.clear,press(clear) else{report["search_clear_failure"]="clear_action_refused";return nil}
+  return "addressed_value_then_semantic_clear"
+ case "set-empty":
+  guard set(seeded.field,kAXValueAttribute,"" as CFString) else{report["search_clear_failure"]="clear_value_submission_failed";return nil}
+  return "addressed_value_cycle"
+ default:report["search_clear_failure"]="clear_binding_unverified";return nil
+ }
+}
 func clearSearchQuery(_ root:AXUIElement)->Bool {
  let owner=NSWorkspace.shared.frontmostApplication?.processIdentifier,keyboard=focusPID()
  guard let initial=completeDiscovery({()->(AXUIElement,String,SearchPreparationFrame)? in
@@ -1282,7 +1586,11 @@ func clearSearchQuery(_ root:AXUIElement)->Bool {
  }),let (field,old,initialFrame)=initial else{return false}
  guard initialFrame.categoryMatches,initialFrame.ownerUnchanged,initialFrame.rawCount>=0,initialFrame.rawCount<=3000 else{return false}
  let cached=currentCategory=="deleted" ? deletedLabels?.count:activeLabels?.count
- if searchClearInitialReady(initialFrame,queryEmpty:old.isEmpty,cachedRawCount:cached ?? -1,modelNeedsProof:searchModelNeedsProof) {boundQuery="";return true}
+ let route=searchClearPreparationRoute(initialFrame,queryEmpty:old.isEmpty,cachedRawCount:cached ?? -1,modelNeedsProof:searchModelNeedsProof,background:backgroundOwnerPID != nil)
+ if route=="ready" {boundQuery="";return true}
+ // Batch/background reads never explore search mutation. A stale or filtered
+ // model must be reset explicitly; a failed read must not leave a sentinel.
+ guard route=="recover" else{report["search_clear_failure"]="clear_model_unverified";return false}
  let beforeCount=initialFrame.rawCount
  report["search_clear_before_count"]=beforeCount
  var range=DarwinBoolean(false),textSettable=DarwinBoolean(false)
@@ -1296,15 +1604,11 @@ func clearSearchQuery(_ root:AXUIElement)->Bool {
   do {try submitQuery(root,"")} catch {report["search_clear_failure"]="clear_text_submission_failed";return false}
   method="addressed_selected_text"
  } else {
-  // Only a complete, positively unsupported capability permits the old
-  // cancel route. Never retry/fallback after an attempted text replacement.
-  guard !old.isEmpty else{report["search_clear_failure"]="clear_model_unverified";return false}
-  let known=["取消","Cancel","清除","Clear","清除搜索","Clear Search","取消搜索","Cancel Search","清空搜索"]
-  guard let matches=completeDiscovery({nodes(field,prune:false).filter{n in
-   text(n,kAXRoleAttribute)=="AXButton" && values([n]).contains{known.contains($0)}
-  }}),matches.count==1 else{report["search_clear_failure"]="clear_button_ambiguous";return false}
-  guard boundedClick(matches[0],root) else{report["search_clear_failure"]="clear_action_refused";return false}
-  method="addressed_cancel_button"
+  // A visibly empty field may still retain a stale zero-result model.
+  // Recover through an exact semantic clear or one bounded value cycle;
+  // neither branch can install an index without the original model proof.
+  guard let recovered=recoverSearchClear(root,old:old,owner:owner,keyboard:keyboard) else{return false}
+  method=recovered
  }
  var witness=SearchPreparationWitness(stage:"clear_model",beforeCount:beforeCount,cachedRawCount:cached ?? -1)
  let until=min(deadline,Date(timeIntervalSinceNow:4))
@@ -1383,12 +1687,159 @@ func witnessedValueQuery(_ root:AXUIElement,_ wanted:String)throws->[[String]] {
  // item_not_found: only a complete All index can prove absence in this case.
  throw nativeFailure("search_target_model_unverified")
 }
+func categoryClearWaitFirst(background:Bool,pendingNavigation:Bool,initialQueryEmpty:Bool)->Bool {
+ background && pendingNavigation && initialQueryEmpty
+}
+func categorySelectionRoute(actualMatches:Bool?)->String {
+ guard let actualMatches else{return "hold"}
+ return actualMatches ? "bind":"navigate"
+}
+struct CurrentCategoryIndexFrame:Decodable {
+ let complete,query_empty,category_matches,owner_unchanged,window_bound:Bool
+ let raw_count,published_count:Int
+ let labels:[[String]]
+ // Native bindings never enter reports or fixture JSON. Pure entry-point
+ // tests pass the equality observation, while production compares CF objects.
+ var bindings:[AXUIElement]=[]
+ enum CodingKeys:String,CodingKey {
+  case complete,query_empty,category_matches,owner_unchanged,window_bound,raw_count,published_count,labels
+ }
+ var structureVerified:Bool {
+  complete && query_empty && category_matches && owner_unchanged && window_bound && raw_count>=0 && raw_count<=3000 &&
+   (raw_count>0 || published_count==0) && (published_count<0 || raw_count>=published_count)
+ }
+ var verified:Bool {structureVerified && labels.count==raw_count}
+}
+func categoryModelPairPermits(_ first:CurrentCategoryIndexFrame,_ second:CurrentCategoryIndexFrame,referencesSame:Bool)->Bool {
+ first.structureVerified && second.structureVerified && referencesSame && first.raw_count==second.raw_count && first.published_count==second.published_count
+}
+func categoryModelReferencesSame(_ first:CurrentCategoryIndexFrame,_ second:CurrentCategoryIndexFrame)->Bool {
+ first.bindings.count==first.raw_count+3 && second.bindings.count==second.raw_count+3 && first.bindings.count==second.bindings.count &&
+  zip(first.bindings,second.bindings).allSatisfy{CFEqual($0.0,$0.1)}
+}
+struct CurrentCategoryIndexWitness {
+ var previous:CurrentCategoryIndexFrame?
+ mutating func observe(_ frame:CurrentCategoryIndexFrame)->Bool {
+  guard frame.verified else{previous=nil;return false}
+  defer{previous=frame}
+  guard let old=previous else{return false}
+  return old.raw_count==frame.raw_count && old.published_count==frame.published_count && old.labels==frame.labels
+ }
+}
+struct DeletedArrivalWitness {
+ let title:String
+ var inventory=CurrentCategoryIndexWitness()
+ mutating func observe(_ frame:CurrentCategoryIndexFrame)->String {
+  guard inventory.observe(frame) else{return "waiting"}
+  let count=matchingNativeLabels(frame.labels,title:title,username:"").count
+  // Internally consistent old negative postimages are not absence proof.
+  return count==1 ? "arrived":(count>1 ? "ambiguous":"waiting")
+ }
+ mutating func incomplete() {inventory.previous=nil}
+}
+func matchingNativeLabels(_ labels:[[String]],title:String,username:String)->[[String]] {
+ labels.filter{$0.contains(title) && (username.isEmpty || $0.contains(username))}
+}
+func deletedCacheMissNeedsCurrent(_ cached:[[String]],title:String)->Bool {
+ matchingNativeLabels(cached,title:title,username:"").isEmpty
+}
+func refreshDeletedCacheOnMiss(_ root:AXUIElement,_ key:[String:String])throws {
+ guard let title=key["title"],let cached=indexedLabels else{throw nativeFailure("index_generation_changed")}
+ guard deletedCacheMissNeedsCurrent(cached,title:title) else{return}
+ // Routing membership never proves absence. Rebind only after two current
+ // complete, unchanged unfiltered Deleted inventories agree.
+ let current=try currentCompleteCategoryLabels(root,"deleted")
+ deletedLabels=current;indexedLabels=current;indexedCategory="deleted";indexedQuery="";boundQuery=""
+}
+func awaitDeletedExpectedArrival(_ root:AXUIElement,_ key:[String:String])throws {
+ guard let title=key["title"],let cached=indexedLabels else{throw nativeFailure("index_generation_changed")}
+ guard deletedCacheMissNeedsCurrent(cached,title:title) else{return}
+ let requestDeadline=deadline,arrivalDeadline=min(deadline,Date(timeIntervalSinceNow:8))
+ // The inner AX traversal and owner checks use the same bounded deadline;
+ // a slow complete-index frame cannot extend the expected-arrival window.
+ deadline=arrivalDeadline;defer{deadline=requestDeadline}
+ var witness=DeletedArrivalWitness(title:title)
+ while Date()<arrivalDeadline,front() {
+  if let frame=currentCategoryIndexFrame(root,"deleted") {
+   guard Date()<arrivalDeadline,front() else{break}
+   let outcome=witness.observe(frame)
+   if outcome=="ambiguous" {throw nativeFailure("item_ambiguous")}
+   if outcome=="arrived" {
+    deletedLabels=frame.labels;indexedLabels=frame.labels;indexedCategory="deleted";indexedQuery="";boundQuery=""
+    return
+   }
+  } else {witness.incomplete()}
+  pause(0.04)
+ }
+ throw nativeFailure("deleted_arrival_unverified")
+}
+func currentCategoryIndexFrame(_ root:AXUIElement,_ category:String,withLabels:Bool=true)->CurrentCategoryIndexFrame? {
+ guard let observed=completeDiscovery({()->CurrentCategoryIndexFrame? in
+  guard !searchModelNeedsProof,front(),currentCategory==category,let (search,list)=context(root),
+   let query=attr(search,kAXValueAttribute) as? String,query.isEmpty,
+   let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=3000,
+   let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,
+   text(windows[0],kAXSubroleAttribute)=="AXStandardWindow",notesProbeAncestorBound(search,windows[0]),notesProbeAncestorBound(list,windows[0]) else{return nil}
+  let beforeCategory=categoryEvidence(root,category)
+  var before=CurrentCategoryIndexFrame(complete:true,query_empty:true,category_matches:beforeCategory.0,owner_unchanged:front(),window_bound:true,
+   raw_count:rows.count,published_count:beforeCategory.1 ?? -1,labels:[])
+  before.bindings=[search,list,windows[0]]+rows
+  guard before.structureVerified else{return nil}
+  let labels=withLabels ? rows.map{rowValues($0)}:[]
+  // Reading a retained row array is not reading the current model. Rebind
+  // after every complete scan and refuse replacement/reordering mid-frame.
+  guard let (freshSearch,freshList)=context(root),let freshQuery=attr(freshSearch,kAXValueAttribute) as? String,freshQuery.isEmpty,
+   let freshRows=attr(freshList,kAXRowsAttribute) as? [AXUIElement],freshRows.count<=3000,
+   let freshWindows=attr(root,kAXWindowsAttribute) as? [AXUIElement],freshWindows.count==1,
+   text(freshWindows[0],kAXSubroleAttribute)=="AXStandardWindow",notesProbeAncestorBound(freshSearch,freshWindows[0]),notesProbeAncestorBound(freshList,freshWindows[0]),
+   front(),currentCategory==category,!searchModelNeedsProof else{return nil}
+  let afterCategory=categoryEvidence(root,category)
+  var after=CurrentCategoryIndexFrame(complete:true,query_empty:true,category_matches:afterCategory.0,owner_unchanged:front(),window_bound:true,
+   raw_count:freshRows.count,published_count:afterCategory.1 ?? -1,labels:labels)
+  after.bindings=[freshSearch,freshList,freshWindows[0]]+freshRows
+  guard categoryModelPairPermits(before,after,referencesSame:categoryModelReferencesSame(before,after)) else{return nil}
+  return after
+ }),let frame=observed else{return nil}
+ return frame
+}
+func waitForCategoryModel(_ root:AXUIElement,_ category:String)throws {
+ var previous:CurrentCategoryIndexFrame?
+ let until=min(deadline,Date(timeIntervalSinceNow:3))
+ while front(),Date()<until {
+  if let frame=currentCategoryIndexFrame(root,category,withLabels:false) {
+   if let prior=previous,categoryModelPairPermits(prior,frame,referencesSame:categoryModelReferencesSame(prior,frame)) {return}
+   previous=frame
+  } else {previous=nil}
+  pause(0.04)
+ }
+ throw nativeFailure("category_model_unverified")
+}
+func currentCompleteCategoryLabels(_ root:AXUIElement,_ category:String)throws->[[String]] {
+ var witness=CurrentCategoryIndexWitness()
+ while front(),Date()<deadline {
+  if let frame=currentCategoryIndexFrame(root,category) {
+   if witness.observe(frame) {return frame.labels}
+  } else {witness.previous=nil}
+  // A missing/incomplete frame must reset adjacency, independently of the
+  // outer request's retained incomplete-observation flag.
+  pause(0.04)
+ }
+ throw nativeFailure("current_absence_proof_incomplete")
+}
 func selectCategory(_ root:AXUIElement,_ category:String,buildIndex:Bool=true)throws {
  guard let contextFrame=completeDiscovery({context(root)}),contextFrame != nil else{throw nativeFailure("locked_or_user_editor")}
+ let initialQueryEmpty=buildIndex && backgroundOwnerPID != nil && completeDiscovery({()->Bool in
+  guard let (search,_)=context(root),let query=attr(search,kAXValueAttribute) as? String else{return false}
+  return query.isEmpty
+ })==true
  let previousEvidence=completeDiscovery({categoryEvidence(root,category)})
- if currentCategory != category || previousEvidence?.0 != true {
+ let navigation=categorySelectionRoute(actualMatches:previousEvidence?.0)
+ try require(navigation != "hold","category_observation_incomplete")
+ if navigation=="bind" {currentCategory=category}
+ if navigation=="navigate" {
   let names=category=="active" ? ["全部","All"]:["已删除","Deleted","Recently Deleted","最近删除"]
   guard let b=categoryButton(root,names) else{throw nativeFailure("category_ambiguous")}
+  categoryNavigationNeedsProof=true
   try require(boundedClick(b,root),"category_selection_failed")
   let until=min(deadline,Date(timeIntervalSinceNow:3));var verified=false
   while front(),Date()<until {
@@ -1400,22 +1851,32 @@ func selectCategory(_ root:AXUIElement,_ category:String,buildIndex:Bool=true)th
   try require(verified,"category_selection_unverified");currentCategory=category
  }
  if !buildIndex {return}
+ if categoryClearWaitFirst(background:backgroundOwnerPID != nil,pendingNavigation:categoryNavigationNeedsProof,initialQueryEmpty:initialQueryEmpty) {
+  // A transient post-navigation reference is not a current stable list.
+  // Establish the existing two-frame category model before a background
+  // empty-query ready observation; no query setter is enabled here.
+  try waitForCategoryModel(root,category);categoryNavigationNeedsProof=false
+ }
  guard context(root) != nil else{throw nativeFailure("locked_or_user_editor")}
  // An empty visible field with a stale zero-result model is not All. The
  // complete initial-model policy keeps normal fresh nonempty All lists usable.
  if buildIndex {
   try require(clearSearchQuery(root),"list_preparation_failed");boundQuery=""
  }
+ if categoryNavigationNeedsProof {try waitForCategoryModel(root,category);categoryNavigationNeedsProof=false}
  try require(context(root).map{text($0.0,kAXValueAttribute).isEmpty} ?? false,"filtered_list_refused")
  boundQuery=""
  guard let (_,list)=context(root),let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],rows.count<=3000 else{throw nativeFailure("list_unavailable")}
  let cached=category=="active" ? activeLabels:deletedLabels
  if let cached {
+  // Equal count permits routing only. A miss must independently scan the
+  // current full model twice; cached membership never proves absence.
   try require(cached.count==rows.count,"index_generation_changed");indexedLabels=cached
  } else {
   try require(!failedIndexCategories.contains(category),"prior_incomplete_index_requires_review")
   failedIndexCategories.insert(category)
-  guard let labels=completeDiscovery({rows.map{rowValues($0)}}) else{throw nativeFailure("incomplete_discovery_snapshot")}
+  guard let frame=currentCategoryIndexFrame(root,category),frame.verified else{throw nativeFailure("incomplete_discovery_snapshot")}
+  let labels=frame.labels
   if category=="active" {activeLabels=labels}else{deletedLabels=labels};indexedLabels=labels
   failedIndexCategories.remove(category)
  }
@@ -1440,7 +1901,7 @@ func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=fal
  let rangeSupported=AXUIElementIsAttributeSettable(search,kAXSelectedTextRangeAttribute as CFString,&rangeSettable) == .success && rangeSettable.boolValue
  let textSupported=AXUIElementIsAttributeSettable(search,kAXSelectedTextAttribute as CFString,&textSettable) == .success && textSettable.boolValue
  let valueSupported=valueSearchAvailable && AXUIElementIsAttributeSettable(search,kAXValueAttribute as CFString,&valueSettable) == .success && valueSettable.boolValue
- var strategy=queryStrategy(rangeSettable:rangeSupported,textSettable:textSupported,valueSettable:valueSupported)
+ var strategy=queryStrategy(rangeSettable:rangeSupported,textSettable:textSupported,valueSettable:valueSupported,background:backgroundOwnerPID != nil)
  report["search_strategy"]=strategy
  if strategy=="witnessed-value" {
   let previousIncomplete=nativeObservationIncomplete
@@ -1500,7 +1961,16 @@ func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=fal
  }
  }
  guard sameIndexScope(cachedCategory:indexedCategory,cachedQuery:indexedQuery,category:category,query:boundQuery),let labels=indexedLabels else{throw nativeFailure("index_scope_changed")}
- let matches=labels.filter{$0.contains(title) && (user.isEmpty || $0.contains(user))}
+ var matches=matchingNativeLabels(labels,title:title,username:user)
+ if matches.isEmpty {
+  // Search cohorts and equal-count cached inventories are routing hints. Only
+  // a fresh, stable, complete unfiltered current inventory proves absence.
+  try selectCategory(root,category,buildIndex:true)
+  let current=try currentCompleteCategoryLabels(root,category)
+  if category=="active" {activeLabels=current}else{deletedLabels=current}
+  indexedLabels=current;indexedCategory=category;indexedQuery="";boundQuery=""
+  matches=matchingNativeLabels(current,title:title,username:user)
+ }
  try require(matches.count>0,"item_not_found");try require(matches.count==1,"item_ambiguous")
  let target=Target(title:title,native_title:title,username:user,notes:"",urls:[])
  let n:NativeRead
@@ -1517,8 +1987,8 @@ func readKey(_ key:[String:String],_ category:String="active",leaveOpen:Bool=fal
   n=observed
  }
  ownEditor=(root,n);ownEditorFields=n.fieldValues
- let value:[String:Any]
- do {value=try snapshot(key,n)} catch {if guardedExpected==nil {_=cancel(root,n)};throw error}
+ guard let value=n.verifiedCanonicalState else{throw nativeFailure("snapshot_incomplete")}
+ try require((value["key"] as? [String:String])==key,"snapshot_identity_changed")
  if !leaveOpen {try require(cancel(root,n),"editor_cancel_unverified");ownEditor=nil;ownEditorFields=nil;ownNotesProbeExpected=nil;ownNotesProbeCleanupAttempted=false}
  return (root,n,value)
 }
@@ -1599,9 +2069,9 @@ func bindNotesProbeCohort(_ cohort:NotesProbeCohort) {
 }
 let notesProbeRoles:Set<String>=["AXTextField","AXTextArea","AXComboBox","AXStaticText","AXGroup","AXScrollArea","AXButton","AXImage","AXLink","AXCheckBox","AXRadioButton","AXPopUpButton","AXOutline","AXTable","AXRow","AXToolbar","AXWindow","AXApplication"]
 func notesProbeAncestorBound(_ element:AXUIElement,_ note:AXUIElement)->Bool {
- var current=element;var seen=Set<UInt>()
+ var current=element;var seen=nativeVisited()
  for _ in 0..<8 {
-  guard Date()<deadline,seen.insert(CFHash(current)).inserted else{return false}
+  guard Date()<deadline,seen.insert(current) else{return false}
   var pid:pid_t=0
   guard AXUIElementGetPid(current,&pid) == .success,pid==appPID else{return false}
   if CFEqual(current,note) {return true}
@@ -1619,13 +2089,13 @@ func notesProbeBoundInternalFocus(_ root:AXUIElement,_ ancestor:AXUIElement,edit
  var value:CFTypeRef?
  let copyCode=AXUIElementCopyAttributeValue(root,kAXFocusedUIElementAttribute as CFString,&value);observeNativeError(copyCode,required:true)
  guard copyCode == .success,let value,CFGetTypeID(value)==AXUIElementGetTypeID() else{return nil}
- let focused=unsafeBitCast(value,to:AXUIElement.self);var current=focused,seen=Set<UInt>()
+ let focused=unsafeBitCast(value,to:AXUIElement.self);var current=focused,seen=nativeVisited()
  var roleValue:CFTypeRef?
  let roleCode=AXUIElementCopyAttributeValue(focused,kAXRoleAttribute as CFString,&roleValue);observeNativeError(roleCode,required:true)
  guard roleCode == .success,let role=roleValue as? String,notesProbeRoles.contains(role),
   !editableOnly || ["AXTextField","AXTextArea","AXComboBox"].contains(role) else{return nil}
  for _ in 0..<16 {
-  guard Date()<deadline,seen.insert(CFHash(current)).inserted else{return nil}
+  guard Date()<deadline,seen.insert(current) else{return nil}
   var pid:pid_t=0
   let pidCode=AXUIElementGetPid(current,&pid);observeNativeError(pidCode,required:true)
   guard pidCode == .success,pid==appPID else{return nil}
@@ -1730,9 +2200,9 @@ func notesProbeInternalFocus(_ root:AXUIElement,_ note:AXUIElement)->[String:Any
  return result
 }
 func notesProbeChildren(_ note:AXUIElement)->[String:Any]? {
- var seen=Set<UInt>(),children:[[String:Any]]=[]
+ var seen=nativeVisited(),children:[[String:Any]]=[]
  func walk(_ element:AXUIElement,_ depth:Int)->Bool {
-  guard Date()<deadline,seen.insert(CFHash(element)).inserted else{return false}
+  guard Date()<deadline,seen.insert(element) else{return false}
   var childValue:CFTypeRef?
   let code=AXUIElementCopyAttributeValue(element,kAXChildrenAttribute as CFString,&childValue)
   if [.attributeUnsupported,.noValue].contains(code) {return true}
@@ -1776,7 +2246,7 @@ func ownedNotesProbeRead(_ root:AXUIElement,_ target:Target,_ expected:[String:A
  var openedByRead=false
  let observed=read(root,target,leaveOpen:true,onEditorOpened:{openedByRead=true})
  report["notes_probe_read_opened"]=openedByRead
- let complete=observed.map{n in !nativeObservationIncomplete && n.sitesKnown && ["TitleField","UserNameField","PasswordField","NotesField"].allSatisfy{n.fieldValues[$0] != nil}} ?? false
+ let complete=observed.map{n in n.verifiedCanonicalState != nil && n.sitesKnown && ["TitleField","UserNameField","PasswordField","NotesField"].allSatisfy{n.fieldValues[$0] != nil}} ?? false
  func originalOwnerUnchanged()->Bool {
   foregroundBefore != nil && (keyboardBefore != nil || foregroundNotesProbeWindow != nil) && NSWorkspace.shared.frontmostApplication?.processIdentifier==foregroundBefore && focusPID()==keyboardBefore && front()
  }
@@ -2025,6 +2495,7 @@ func deletedNote(_ key:[String:String],_ expected:[String:Any])throws->[String:A
   expected["sharing"] as? String=="unshared" && (expected["extra_fields"] as? [[String:String]])?.isEmpty==true,"deleted_proof_invalid")
  guard let expectedNote=expected["notes"] as? String,!expectedNote.isEmpty else{throw nativeFailure("deleted_proof_invalid")}
  let root=try freshRoot();try selectCategory(root,"deleted")
+ try awaitDeletedExpectedArrival(root,key)
  guard let (_,list)=context(root),let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],let labels=indexedLabels,rows.count==labels.count else{throw nativeFailure("index_generation_changed")}
  let indexes=labels.indices.filter{labels[$0].contains(key["title"]!)}
  try require(indexes.count>0,"item_not_found");try require(indexes.count==1,"item_ambiguous")
@@ -2062,6 +2533,138 @@ func deletedNote(_ key:[String:String],_ expected:[String:Any])throws->[String:A
   pause(0.05)
  }
  throw nativeFailure("deleted_body_unverified")
+}
+let readEditorDiagnosticKeys=["read_editor_opened","read_editor_previous_incomplete","read_editor_observation_complete","read_editor_frames_observed"]
+let deletedLocationDiagnosticKeys=["deleted_row_action_names","deleted_row_child_count","deleted_row_structure_complete","deleted_row_press_attempted","deleted_row_press_code","deleted_row_children"]
+func deletedRowStructure(_ row:AXUIElement) {
+ let knownActions=Set(["AXPress","AXConfirm","AXPick","AXShowMenu","AXRaise","AXCancel","AXIncrement","AXDecrement"])
+ let knownRoles=Set(["AXRow","AXStaticText","AXButton","AXGroup","AXImage"])
+ var count = -1,children:[[String:Any]]=[],rowActions:[String]=[]
+ let complete=completeDiscovery {()->Bool in
+  func actions(_ node:AXUIElement)->[String]? {
+   var raw:CFArray?
+   let code=AXUIElementCopyActionNames(node,&raw);observeNativeError(code)
+   if [.attributeUnsupported,.noValue].contains(code) {return []}
+   guard code == .success,let names=raw as? [String],names.count<=8,names.allSatisfy({knownActions.contains($0)}) else{return nil}
+   return names
+  }
+  guard let names=actions(row) else{return false};rowActions=names
+  var raw:CFTypeRef?
+  let code=AXUIElementCopyAttributeValue(row,kAXChildrenAttribute as CFString,&raw);observeNativeError(code)
+  let direct:[AXUIElement]
+  if [.attributeUnsupported,.noValue].contains(code) {direct=[]}
+  else if code == .success,let observed=raw as? [AXUIElement],observed.count<=16 {direct=observed}
+  else{return false}
+  count=direct.count
+  for child in direct {
+   var pid:pid_t=0
+   let pidCode=AXUIElementGetPid(child,&pid);observeNativeError(pidCode,required:true)
+   let role=text(child,kAXRoleAttribute)
+   guard let parent=attr(child,kAXParentAttribute),CFGetTypeID(parent)==AXUIElementGetTypeID(),let names=actions(child) else{return false}
+   let parentBound=CFEqual(unsafeBitCast(parent,to:AXUIElement.self),row),samePID=pidCode == .success && pid==appPID
+   children.append(["role":knownRoles.contains(role) ? role:"AXUnknown","identifier_present":!text(child,kAXIdentifierAttribute).isEmpty,
+    "same_pid":samePID,"parent_bound":parentBound,"action_names":names])
+   guard parentBound,samePID else{return false}
+  }
+  return front()
+ }==true
+ report["deleted_row_action_names"]=rowActions;report["deleted_row_child_count"]=count
+ report["deleted_row_structure_complete"]=complete;report["deleted_row_children"]=children
+ report["deleted_row_press_attempted"]=false;report["deleted_row_press_code"] = -1
+}
+func deletedLocationPathBound(_ node:AXUIElement,_ window:AXUIElement)->Bool {
+ var current=node
+ for _ in 0..<24 {
+  var pid:pid_t=0
+  let code=AXUIElementGetPid(current,&pid);observeNativeError(code,required:true)
+  guard code == .success,pid==appPID else{return false}
+  if CFEqual(current,window) {return true}
+  let role=text(current,kAXRoleAttribute),id=text(current,kAXIdentifierAttribute)
+  guard !["AXOutline","AXTable","AXToolbar","AXSheet"].contains(role),id != "AccountListView",
+   let parent=attr(current,kAXParentAttribute),CFGetTypeID(parent)==AXUIElementGetTypeID() else{return false}
+  let next=unsafeBitCast(parent,to:AXUIElement.self)
+  guard let children=attr(next,kAXChildrenAttribute) as? [AXUIElement],children.count<=256,
+   children.filter({CFEqual($0,current)}).count==1 else{return false}
+  current=next
+ }
+ return false
+}
+func deletedLocationSameDetail(_ title:AXUIElement,_ recovery:AXUIElement,_ window:AXUIElement)->Bool {
+ guard deletedLocationPathBound(title,window),deletedLocationPathBound(recovery,window) else{return false}
+ var current=title
+ for _ in 0..<16 {
+  guard let parent=attr(current,kAXParentAttribute),CFGetTypeID(parent)==AXUIElementGetTypeID() else{return false}
+  current=unsafeBitCast(parent,to:AXUIElement.self)
+  if CFEqual(current,window) {return false}
+  let span=nodes(current)
+  guard span.count<=256,!span.contains(where:{["AXToolbar","AXOutline","AXTable","AXSheet"].contains(text($0,kAXRoleAttribute)) || text($0,kAXIdentifierAttribute)=="AccountListView"}) else{return false}
+  if span.filter({CFEqual($0,title)}).count==1,span.filter({CFEqual($0,recovery)}).count==1 {return true}
+ }
+ return false
+}
+func deletedLocationRead(_ key:[String:String],_ expected:[String:Any])throws->[String:Any] {
+ try require(deletedLocationPreimageValid(key,expected),"deleted_proof_invalid")
+ let root=try freshRoot();try selectCategory(root,"deleted")
+ try refreshDeletedCacheOnMiss(root,key)
+ let owner=NSWorkspace.shared.frontmostApplication?.processIdentifier,keyboard=focusPID()
+ guard let initial=completeDiscovery({()->(AXUIElement,[AXUIElement],[[String]],AXUIElement)? in
+  guard let (_,list)=context(root),let rows=attr(list,kAXRowsAttribute) as? [AXUIElement],let labels=indexedLabels,rows.count==labels.count,
+   let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,text(windows[0],kAXSubroleAttribute)=="AXStandardWindow" else{return nil}
+  return (list,rows,labels,windows[0])
+ }),let initial else{throw nativeFailure("index_generation_changed")}
+ let (list,rows,labels,window)=initial
+ let indexes=labels.indices.filter{labels[$0].contains(key["title"]!)}
+ try require(!indexes.isEmpty,"item_not_found");try require(indexes.count==1,"item_ambiguous")
+ let index=indexes[0],row=rows[index]
+ try require(completeDiscovery({rowValues(row)})==labels[index],"index_identity_changed")
+ deletedRowStructure(row)
+ var writable=DarwinBoolean(false)
+ let code=AXUIElementIsAttributeSettable(list,kAXSelectedRowsAttribute as CFString,&writable)
+ observeNativeError(code)
+ let selected=code == .success && writable.boolValue && set(list,kAXSelectedRowsAttribute,[row] as CFArray)
+ try require(selected || set(row,kAXSelectedAttribute,kCFBooleanTrue),"select_unique_row_failed")
+ let recoveryNames=["恢复密码","Recover Password","恢复","Recover","恢复备注","Recover Note","恢复密码…","Recover Password…"]
+ let until=min(deadline,Date(timeIntervalSinceNow:5))
+ var witness=DeletedLocationWitness(),observedFrames=0
+ while front(),Date()<until {
+  var selectedExact=false,titleMatches=false,recoveryUnique=false,queryEmpty=false,categoryDeleted=false,ownerUnchanged=false,processWindowBound=false,detailBound=false,nativeTitle=""
+  let complete=completeDiscovery {()->Bool in
+   guard let (search,currentList)=context(root),let query=attr(search,kAXValueAttribute) as? String,
+    let currentRows=attr(currentList,kAXRowsAttribute) as? [AXUIElement],currentRows.count==labels.count,index<currentRows.count,
+    CFEqual(currentRows[index],row),rowValues(currentRows[index])==labels[index] else{return false}
+   queryEmpty=query.isEmpty
+   var raw:CFTypeRef?
+   let selectionCode=AXUIElementCopyAttributeValue(currentList,kAXSelectedRowsAttribute as CFString,&raw);observeNativeError(selectionCode,required:true)
+   if selectionCode == .success,let selectedRows=raw as? [AXUIElement],selectedRows.count==1,
+    CFEqual(selectedRows[0],currentRows[index]),rowValues(selectedRows[0])==labels[index] {selectedExact=true}
+   let applications=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
+   processWindowBound=applications.count==1 && applications[0].processIdentifier==appPID && apple(appPID)
+   guard let windows=attr(root,kAXWindowsAttribute) as? [AXUIElement],windows.count==1,CFEqual(windows[0],window),text(window,kAXSubroleAttribute)=="AXStandardWindow" else{return false}
+   let view=nodes(root)
+   guard !view.contains(where:{text($0,kAXRoleAttribute)=="AXSheet" || (["TitleField","UserNameField","PasswordField","NotesField"].contains(text($0,kAXIdentifierAttribute)) && ["AXTextField","AXTextArea","AXComboBox"].contains(text($0,kAXRoleAttribute)))}) else{return false}
+   let titles=view.filter{text($0,kAXIdentifierAttribute)=="TitleField" && text($0,kAXRoleAttribute)=="AXStaticText"}
+   let recovery=view.filter{text($0,kAXRoleAttribute)=="AXButton" && values([$0]).contains{recoveryNames.contains($0)}}
+   recoveryUnique=recovery.count==1
+   if titles.count==1,let actual=attr(titles[0],kAXValueAttribute) as? String {
+    nativeTitle=actual;titleMatches=actual==key["title"]
+    if recovery.count==1 {detailBound=deletedLocationSameDetail(titles[0],recovery[0],window)}
+   }
+   categoryDeleted=categoryEvidence(root,"deleted").0
+   ownerUnchanged=front() && NSWorkspace.shared.frontmostApplication?.processIdentifier==owner && focusPID()==keyboard
+   return true
+  }==true
+  observedFrames=min(3000,observedFrames+1)
+  report["deleted_selected_exact"]=selectedExact;report["deleted_title_matches"]=titleMatches;report["deleted_note_matches"]=false
+  report["deleted_recovery_unique"]=recoveryUnique;report["deleted_frame_complete"]=complete;report["deleted_frames_observed"]=observedFrames
+  let frame=DeletedLocationFrame(selected_exact:selectedExact,title_matches:titleMatches,recovery_unique:recoveryUnique,query_empty:queryEmpty,category_deleted:categoryDeleted,owner_unchanged:ownerUnchanged,process_window_bound:processWindowBound,detail_bound:detailBound,complete:complete,row_binding:0,native_title:nativeTitle)
+  if witness.observe(frame) {
+   var result=deletedLocationResult(key,nativeTitle:nativeTitle),diagnostics:[String:Any]=[:]
+   for name in deletedLocationDiagnosticKeys {if let value=report[name] {diagnostics[name]=value}}
+   result["diagnostics"]=diagnostics;return result
+  }
+  pause(0.05)
+ }
+ throw nativeFailure("deleted_location_unverified")
 }
 func execute(_ q:[String:Any])throws->[String:Any] {
  let op=q["op"] as? String ?? ""
@@ -2155,7 +2758,7 @@ func execute(_ q:[String:Any])throws->[String:Any] {
    "passwords_frontmost":running.count==1 && NSWorkspace.shared.frontmostApplication?.processIdentifier==running[0].processIdentifier,
    "whole_vault_public_api":false,"native_protocol_delete_assumed":false]
  }
- try require(["read","deleted-read","notes-set","delete-redundant-note","recover-readonly-editor","notes-editor-probe","synthetic-foreground-notes-input"].contains(op),"operation_unsupported")
+ try require(["read","deleted-read","deleted-location-read","notes-set","delete-redundant-note","recover-readonly-editor","notes-editor-probe","synthetic-foreground-notes-input"].contains(op),"operation_unsupported")
  let recovery=q["expected"] as? [String:Any]
  var foregroundFocus=false
  guard let key=(q["key"] as? [String:String]) ?? (["recover-readonly-editor","notes-editor-probe"].contains(op) ? recovery?["key"] as? [String:String]:nil),Set(key.keys)==Set(["title","username"]),!(key["title"] ?? "").isEmpty else{throw nativeFailure("identity_invalid")}
@@ -2185,7 +2788,7 @@ func execute(_ q:[String:Any])throws->[String:Any] {
  let applications=NSRunningApplication.runningApplications(withBundleIdentifier:"com.apple.Passwords")
  guard applications.count==1,let a=applications.first,apple(a.processIdentifier) else{throw nativeFailure("native_access_unavailable")}
  if appPID != a.processIdentifier {
-  activeLabels=nil;deletedLabels=nil;indexedLabels=nil;currentCategory="";indexedCategory="";indexedQuery="";boundQuery="";failedIndexCategories=[];valueSearchAvailable=true
+  activeLabels=nil;deletedLabels=nil;indexedLabels=nil;currentCategory="";categoryNavigationNeedsProof=false;indexedCategory="";indexedQuery="";boundQuery="";failedIndexCategories=[];valueSearchAvailable=true
  }
  appPID=a.processIdentifier
  if ["notes-editor-probe","synthetic-foreground-notes-input"].contains(op),foregroundFocus {
@@ -2212,6 +2815,10 @@ func execute(_ q:[String:Any])throws->[String:Any] {
  if op=="deleted-read" {
   guard let expected=q["expected"] as? [String:Any] else{throw nativeFailure("deleted_proof_required")}
   return try deletedNote(key,expected)
+ }
+ if op=="deleted-location-read" {
+  guard let expected=q["expected"] as? [String:Any] else{throw nativeFailure("deleted_proof_required")}
+  return try deletedLocationRead(key,expected)
  }
  guard let expected=q["expected"] as? [String:Any] else{throw nativeFailure("preimage_required")}
  let (root,n,before)=try readKey(key,leaveOpen:true)
@@ -2274,6 +2881,7 @@ while let line=readLine(strippingNewline:true) {
  deadline=Date(timeIntervalSinceNow:90);nativeObservationIncomplete=false
  foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil
  for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","search_phase","search_wait_end","search_result_count","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {report[key]=nil}
+ for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys {report[key]=nil}
  var response:[String:Any]=["ok":false,"app_activated":false,"backend":"apple-passwords-accessibility"]
  do {
   guard line.utf8.count<=4*1024*1024,let bytes=line.data(using:.utf8),let q=try JSONSerialization.jsonObject(with:bytes) as? [String:Any],let id=q["id"] as? Int else{throw nativeFailure("request_invalid")}
@@ -2288,6 +2896,7 @@ while let line=readLine(strippingNewline:true) {
   for key in ["confirmation_bridge_failure","confirmation_native_editor_role","confirmation_bridge_timed_out","confirmation_account_list_enumerated","confirmation_bridge_exit_code","confirmation_bridge_system_error_code","confirmation_editor_path_depth","failure_stage","status","ui_set_attribute","ui_set_error_code","ui_press_error_code","request_owner_mode","search_strategy","search_witness_failure","native_incomplete_error_counts","owner_guard_observation","all_list_bridge_failure","all_list_bridge_stage","all_list_bridge_error_code","all_list_bridge_exit_code","all_list_bridge_timed_out","search_clear_method","search_clear_failure","search_clear_before_count","search_clear_after_count","search_model_frames","search_model_frame_counts","deleted_selected_exact","deleted_title_matches","deleted_note_matches","deleted_recovery_unique","deleted_frame_complete","deleted_frames_observed","bounded_click_bridge_exit_code","bounded_click_bridge_failure","bounded_click_bridge_error_code","search_phase","search_wait_end","search_result_count","notes_role","notes_range_code","notes_text_code","notes_value_code","notes_range_settable","notes_text_settable","notes_value_settable","notes_action_names","notes_actions_code","notes_observation_frames","notes_observation_end","notes_children","notes_internal_focus","notes_probe_stage","notes_probe_row_count","notes_probe_read_opened","notes_probe_recovery_attempted","notes_probe_editor_recovered","notes_probe_editor_requires_review","focus_requested","focus_settable","focus_set_code","focus_verified","synthetic_input_stage","synthetic_input_event_count","synthetic_input_permission","synthetic_input_selection_verified","synthetic_input_postimage_verified","synthetic_input_persisted_verified","synthetic_input_editor_requires_review"] {
    if let value=report[key] {diagnostics[key]=value}
   }
+  for key in deletedLocationDiagnosticKeys + readEditorDiagnosticKeys {if let value=report[key] {diagnostics[key]=value}}
   response["diagnostics"]=diagnostics
  }
  foregroundNotesProbeWindow=nil;foregroundNotesProbeOriginalPID=nil

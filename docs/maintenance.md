@@ -20,17 +20,16 @@ events or set focus. The explicitly requested synthetic foreground probe describ
 below has a separate, guarded internal field-focus operation. Commands may
 change the internal category, clear a search, select a record, open its editor,
 and dispatch its semantic Save/Delete actions in an already unlocked window.
-Active lookup first replaces the search field's complete selected text and
-verifies the query and at most 100 fresh result rows. If unsupported, AXValue is
-accepted only after a random query demonstrably empties the actual list and the
-target list is independently stable. The last fallback is one complete,
-unfiltered category index per helper session; a partial index is refused and
-not repeatedly rescanned. Filtered indexes are never reused as whole-library
-evidence. Recently Deleted is indexed separately. Search clearing uses the addressed SelectedText path when it is independently
-supported, or a positively identified search-field Cancel button when it is not.
-It requires two complete observations of the restored list. An empty visible
-query with zero rows and a positive sidebar count is not an empty library; it
-stops before indexing or absence checks.
+Background lookup uses the complete unfiltered category index directly. It does
+not probe or rewrite the search field. If the visible search is nonempty or its
+list model is incomplete, the command stops without altering the query. This
+avoids leaving a visible empty field bound to an old empty result model.
+
+The foreground-only lookup strategies remain guarded by live model witnesses.
+Filtered indexes are never reused as whole-library evidence. Recently Deleted
+is indexed separately. Cached labels may route a positive lookup, whose selected
+record is re-read completely. A missing target requires two fresh, complete,
+stable unfiltered observations; equal row counts do not prove absence.
 
 Touch ID and app unlocking require the person. Locked/unsupported windows stop
 the command. `item doctor` reports actual local access/window availability;
@@ -43,8 +42,10 @@ The compiled CLI/helper boundary tests pass. A live synthetic trial has verified
 exact reads and exposed an Apple editor behavior: AXValue updates the visible
 NotesField but does not persist its model. The replacement implementation uses
 complete AXSelectedText replacement with exact UTF-16 range and unchanged global
-focus checks. This new live write path and recoverable deletion still need a
-successful Apple synthetic trial; unattended batch cleanup is not accepted. Exact bounded
+focus checks. The new live notes write path still needs a successful Apple synthetic trial.
+Targeted live batch reads and individual recoverable deletion have been observed;
+content-preservation reconciliation has also succeeded for a historical pending
+operation. Uninterrupted batch cleanup remains under live verification. Exact bounded
 search has succeeded live, but a subsequent read-only review found its text
 submission unavailable and stopped before mutation. Search capability is not
 reliably established. The advertised search Confirm action was also refused in a
@@ -54,7 +55,9 @@ does not certify Apple operations.
 Readiness reports distinguish editor, unavailable and incomplete views;
 an unavailable context does not establish locking from text such as `unlock`.
 static detail labels are not classified as editable fields. Each request obtains
-a fresh owner lease; transient invalid UI frames are discarded rather than
+a fresh owner lease. AX elements are deduplicated by CFEqual within CFHash
+buckets, because distinct live elements can share a hash; their subtrees must
+not disappear from a complete observation. Transient invalid UI frames are discarded rather than
 poisoning a later complete observation. NotesField accepts the actually observed
 AXTextField as well as AXTextArea role; other fields cannot use the notes setter.
 Do not treat mock
@@ -149,6 +152,41 @@ Read captures a complete state and a canonical SHA-256. Title/account identifies
 a record only when exactly one native row matches; it is not a permanent Apple
 record ID. Ambiguous same-title/account duplicates are refused.
 
+For a targeted batch, explicitly preserve completed reads if a later target fails:
+
+```sh
+apw batch inspect --targets /private/directory/targets.json \
+  --output /private/directory/new-snapshots.json --save-partial
+```
+
+The command stops at the first error and exits nonzero. It never reads the next
+target or automatically retries, including after a timeout, malformed helper
+reply, ambiguous/missing item, or unclosed editor. When the reserved output is
+still private and safely bound, it fsyncs only the completed, validated prefix
+as `apw-item-snapshots-v1`, with `complete:false`, `requested_count`, one-based
+`failed_index`, and `failures:[{"index":N,"error":"maintenance_..."}]`.
+Every saved `items` entry contains its full state and canonical SHA-256; the
+failed target is excluded. An error on the first target produces an empty prefix.
+Public error diagnostics expose only safe structural evidence, positions,
+`completed_reads` and `partial_saved:true`; no snapshot values are printed.
+An unsafe/replaced/linked output is refused rather than receiving cleartext.
+
+The default remains all-or-nothing: without `--save-partial`, a failed batch
+does not write the buffered prefix. Full success retains the existing
+`{"format":"apw-item-snapshots-v1","items":[...]}` schema in either mode.
+Startup/input/output failures before a target read do not invent a partial
+manifest. This is first-error salvage, not a per-read crash checkpoint.
+
+A partial manifest is evidence only for its saved items. It does not prove full
+target coverage, whole-library inventory, or absence of an omitted identity.
+After resolving the failed helper/editor state, use a new private targets file
+starting at the failed target and a new output pathname to inspect the remainder.
+Do not repeat the successful prefix or overwrite its existing artifact. Plans
+may reference only explicitly selected saved items with verified hashes; a
+candidate/keeper deletion pair requires both complete states. `batch run` still
+performs fresh native reads and full before-hash checks for every planned item.
+Saving a prefix grants no extra deletion or continuation authority.
+
 An unchanged readonly editor left by an interrupted helper can be safely closed:
 
 ```sh
@@ -192,14 +230,24 @@ records are held.
 }
 ```
 
-Deletion is currently deliberately limited to unshared, credential-free notes
-with no sites, OTP, passkey, or additional editable data. The keeper's full live
-state is checked before and after. Ordinary recoverable deletion is confirmed,
-then the exact title and full note body must appear in the immutable Recently
-Deleted detail view. Deleted verification binds this placement/body evidence to
-the captured pre-deletion empty-credential snapshot; it does not read passwords
-from Deleted. Normal login deduplication and passkey/group inventory are not yet
-implemented. A count alone is not proof of identity coverage.
+Deletion is deliberately limited to unshared, credential-free notes with no
+sites, OTP, passkey, or additional editable data. The keeper's full live state
+is checked before and after. Only ordinary recoverable deletion is dispatched.
+New deletions first save a private, fsynced full preimage and check for a
+same-title collision in Recently Deleted.
+
+The default outcome proof reads the full immutable Deleted body. When a complete
+Deleted view explicitly fails only because it does not expose that body, a
+separate conservation proof is available for this narrow empty-credential note
+shape: exact Deleted location in two complete frames, fresh Active absence,
+and two independent complete keeper reads equal to the original keeper hash,
+including the entire candidate body and every source identifier. The journal
+records `content_preservation_verified:true` and `deleted_body_verified:false`.
+It does not claim to have read or verified the hidden Deleted body. Existing
+uncertain operations are reconciled read-only and never automatically re-deleted.
+
+Normal login deduplication and passkey/group inventory are not yet implemented.
+A count alone is not proof of identity coverage.
 
 ```sh
 apw batch run --plan /private/directory/plan.json \
@@ -223,6 +271,34 @@ can handle a native/list title difference. Legacy intents without that metadata
 still require reconstruction to match the original complete hash exactly.
 Legacy notes intents without complete before-snapshot evidence are held for
 review; a matching after hash in an editable journal is insufficient.
+
+For a long batch, explicitly reuse qualified historical completions:
+
+```sh
+apw batch run --apply --skip-completed --plan /private/directory/plan.json \
+  --journal /private/directory/journal.jsonl
+```
+
+The default still rechecks every completed outcome read-only. This option skips
+current Apple reads only for a final `done` backed by the original plan/id,
+consistent ordered checkpoint history, a private single-link journal and the
+private complete original snapshot at its fixed journal-derived path. Notes
+completions must bind the unique planned after-state hash. Deletion completions
+must carry a consistent content-preservation/deleted-body proof. Legacy or
+damaged completion metadata is not trusted for skipping and instead follows the
+existing read-only audit; invalid plan/preimage evidence still stops execution.
+
+`intent` and `uncertain` always follow read-only outcome reconciliation and
+never dispatch the old mutation again. `reviewed-no-change` is not skipped: its
+existing explicit unchanged-review authorization and checks remain unchanged.
+New operations still require fresh full preimages and their normal verification.
+No extra writes, retry authority, imports or exports are introduced by this flag.
+
+The result adds `skipped_completed` only when requested. `completed` counts this
+run's verified outcomes/new operations and excludes those historical skips;
+their sum may cover `total`, but skipped entries are **not** current Apple-state
+verification. Proof counters likewise count only this run's checks. Use the
+default mode whenever a current audit of already completed outcomes is needed.
 
 An operator can explicitly resolve a failed, unchanged operation with a read-only
 review. It checks the entire original state before permitting a later dispatch:
